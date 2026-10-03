@@ -308,6 +308,19 @@ async def handle_stats_command(message: types.Message):
         await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
+@group_router.message(Command("id"))
+async def handle_chat_id_command(message: types.Message):
+    """آیدی عددی گروه را نشان می‌دهد (برای پر کردن LISTING_CHAT_ID). فقط ادمین‌ها."""
+    chat = message.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    is_admin = (message.sender_chat is not None and message.sender_chat.id == chat.id) or (
+        message.from_user is not None and await _is_group_admin(message.bot, chat.id, message.from_user.id)
+    )
+    if is_admin:
+        await message.answer(f"🆔 آیدی این گروه:\n<code>{chat.id}</code>", parse_mode="HTML")
+
+
 async def _maybe_auto_post(bot: Bot) -> None:
     if not STATS_AUTO_TIME:
         return
