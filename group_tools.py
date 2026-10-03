@@ -23,6 +23,7 @@ group_tools.py
     GROUP_IDS            = -1001234,-1005678         (خالی = همه‌ی گروه‌هایی که ربات در آن‌هاست)
     GROUP_STATS_DB       = group_stats.sqlite3       (روی Render مسیر دیسک پایدار بدهید)
     STATS_TOP_N          = 50
+    MEMBER_CACHE_TTL     = 21600                     (شبکه‌ی ایمنی؛ لازم نیست دست بزنید)
     STATS_AUTO_TIME      = 23:00                     (به وقت تهران؛ خالی = ارسال خودکار خاموش)
 ---------------------------------------------------------
 """
@@ -68,7 +69,7 @@ STATS_AUTO_TIME = os.getenv("STATS_AUTO_TIME", "").strip()  # "23:00"
 STATS_WINDOW_DAYS = 7
 
 FLUSH_INTERVAL = 10          # ثانیه: هر چند ثانیه شمارنده‌ها در دیتابیس ذخیره شوند
-MEMBER_CACHE_TTL = 600       # ثانیه: کاربرِ عضو کانال تا این مدت دوباره چک نمی‌شود
+MEMBER_CACHE_TTL = int(os.getenv("MEMBER_CACHE_TTL", "21600"))  # فقط شبکه‌ی ایمنی (۶ ساعت)؛ خروج از کانال با رویداد chat_member فوراً از کش پاک می‌شود
 ADMIN_CACHE_TTL = 300
 WARN_COOLDOWN = 30           # هر کاربر حداکثر هر ۳۰ ثانیه یک هشدار می‌گیرد
 WARN_DELETE_AFTER = 25       # پیام هشدار بعد از این مدت پاک می‌شود
@@ -370,6 +371,43 @@ def _log_throttled(msg: str) -> None:
         logger.error(msg)
 
 
+def _status_is_member(cm) -> bool:
+    status = getattr(cm.status, "value", cm.status)
+    return status in ("creator", "administrator", "member") or (
+        status == "restricted" and bool(getattr(cm, "is_member", False))
+    )
+
+
+def _is_force_channel(chat) -> bool:
+    """آیا این چت همان کانال عضویت اجباری است؟"""
+    if isinstance(FORCE_CHANNEL, int):
+        return chat.id == FORCE_CHANNEL
+    return (chat.username or "").lower() == FORCE_CHANNEL.lstrip("@").lower()
+
+
+@group_router.chat_member()
+async def on_channel_member_update(event: types.ChatMemberUpdated):
+    """
+    تلگرام خودش هر بار کسی وارد/خارج کانال شود این رویداد را می‌فرستد (بدون هیچ فشار اضافه).
+    ربات باید ادمین کانال باشد و "chat_member" در allowed_updates باشد.
+    """
+    if not FORCE_JOIN_ENABLED or not _is_force_channel(event.chat):
+        return
+    user_id = event.new_chat_member.user.id
+    if _status_is_member(event.new_chat_member):
+        _member_cache[user_id] = time.time() + MEMBER_CACHE_TTL
+        logger.info(f"[group_tools] {user_id} عضو کانال شد")
+    else:
+        _member_cache.pop(user_id, None)
+        _exempt_cache_clear_user(user_id)
+        logger.info(f"[group_tools] {user_id} از کانال خارج شد؛ از لیست مجازها حذف شد")
+
+
+def _exempt_cache_clear_user(user_id: int) -> None:
+    for key in [k for k in _exempt_cache if k[1] == user_id]:
+        _exempt_cache.pop(key, None)
+
+
 async def is_channel_member(bot: Bot, user_id: int, use_cache: bool = True) -> Optional[bool]:
     """True/False، یا None اگر استعلام ممکن نبود (در این حالت کاربر را رد نمی‌کنیم)."""
     now = time.time()
@@ -383,10 +421,7 @@ async def is_channel_member(bot: Bot, user_id: int, use_cache: bool = True) -> O
             f"(ربات باید ادمین کانال باشد؛ تا آن موقع محدودیت اعمال نمی‌شود)"
         )
         return None
-    status = getattr(cm.status, "value", cm.status)
-    is_member = status in ("creator", "administrator", "member") or (
-        status == "restricted" and bool(getattr(cm, "is_member", False))
-    )
+    is_member = _status_is_member(cm)
     if is_member:
         _member_cache[user_id] = now + MEMBER_CACHE_TTL
     else:
