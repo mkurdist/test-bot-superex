@@ -631,7 +631,7 @@ async def main():
 
     logging.info("🚀 Bot polling started")
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_member"])
     finally:
         await shutdown_group_tools()
         await shared_session.close()
