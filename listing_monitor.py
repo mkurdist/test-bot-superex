@@ -31,8 +31,8 @@ listing_monitor.py
 
 متغیرهای محیطی:
     BOT_TOKEN                توکن ربات (همان که main.py استفاده می‌کند)
-    LISTING_CHAT_ID          آیدی کانال/گروه مقصد (مثل -100123... یا @channel)
-    LISTING_THREAD_ID        (اختیاری) آیدی تاپیک، برای سوپرگروه‌های Forum
+    LISTING_CHAT_ID          مقصدها با کاما جدا (کانال/گروه): @mychannel,-100123456789
+                             برای تاپیک گروه: -100123456789:55
     LISTING_CHECK_INTERVAL   فاصله‌ی چک به ثانیه (پیش‌فرض 600)
     LISTING_SOURCE_URL       (اختیاری) آدرس صفحه
     LISTING_MAX_PER_CYCLE    سقف پیام در هر دوره (پیش‌فرض 5)
@@ -104,8 +104,7 @@ class TelegramError(Exception):
 @dataclass(frozen=True)
 class Config:
     bot_token: str
-    chat_id: str
-    thread_id: Optional[int]
+    chat_ids: tuple  # هر عضو: (chat_id, thread_id|None)
     source_url: str
     interval: int
     max_per_cycle: int
@@ -122,11 +121,17 @@ class Config:
             load_dotenv()
         except ImportError:
             pass
-        thread = os.getenv("LISTING_THREAD_ID", "").strip()
+        # چند مقصد با کاما: «@mychannel,-1001234567890» یا برای تاپیک «-1001234567890:55»
+        targets = []
+        for part in os.getenv("LISTING_CHAT_ID", "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            chat, _, thread = part.partition(":")
+            targets.append((chat.strip(), int(thread) if thread.strip().isdigit() else None))
         return cls(
             bot_token=os.getenv("BOT_TOKEN", "").strip(),
-            chat_id=os.getenv("LISTING_CHAT_ID", "").strip(),
-            thread_id=int(thread) if thread.isdigit() else None,
+            chat_ids=tuple(targets),
             source_url=os.getenv("LISTING_SOURCE_URL", DEFAULT_SOURCE_URL).strip(),
             interval=max(60, int(os.getenv("LISTING_CHECK_INTERVAL", "600"))),
             max_per_cycle=max(1, int(os.getenv("LISTING_MAX_PER_CYCLE", "5"))),
@@ -141,7 +146,7 @@ class Config:
         missing = []
         if need_telegram and not self.bot_token:
             missing.append("BOT_TOKEN")
-        if need_telegram and not self.chat_id:
+        if need_telegram and not self.chat_ids:
             missing.append("LISTING_CHAT_ID")
         if missing:
             raise SystemExit(f"متغیرهای محیطی لازم تنظیم نشده‌اند: {', '.join(missing)}")
@@ -422,14 +427,28 @@ class TelegramSender:
         return str(text).replace(self.cfg.bot_token, "***")
 
     def send(self, listing: Listing) -> None:
+        """به همه‌ی مقصدها می‌فرستد. فقط اگر به هیچ‌کدام نرسید خطا می‌دهد (تا خبر تکراری نشود)."""
+        ok = 0
+        last_error: Optional[TelegramError] = None
+        for chat_id, thread_id in self.cfg.chat_ids:
+            try:
+                self._send_to(listing, chat_id, thread_id)
+                ok += 1
+            except TelegramError as e:
+                logger.error(f"ارسال به {chat_id} ناموفق: {e}")
+                last_error = e
+        if ok == 0:
+            raise last_error or TelegramError("هیچ مقصدی تنظیم نشده")
+
+    def _send_to(self, listing: Listing, chat_id: str, thread_id: Optional[int]) -> None:
         payload = {
-            "chat_id": self.cfg.chat_id,
+            "chat_id": chat_id,
             "text": format_message(listing, html_mode=True),
             "parse_mode": "HTML",
             "disable_web_page_preview": not self.cfg.preview,
         }
-        if self.cfg.thread_id:
-            payload["message_thread_id"] = self.cfg.thread_id
+        if thread_id:
+            payload["message_thread_id"] = thread_id
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             try:
