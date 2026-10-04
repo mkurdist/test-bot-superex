@@ -179,6 +179,43 @@ class Listing:
     article_id: int
     title: str
     url: str
+    date_str: str = ""  # تاریخ مقاله (اضافه شده برای نمایش شمسی)
+
+
+# ===========================================================
+# توابع کمکی برای تبدیل تاریخ
+# ===========================================================
+def gregorian_to_jalali(gy: int, gm: int, gd: int) -> tuple:
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (355666 + (365 * gy) + ((gy2 + 3) // 4) - ((gy2 + 99) // 100)
+            + ((gy2 + 399) // 400) + gd + g_d_m[gm - 1])
+    jy = -1595 + (33 * (days // 12053))
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + (days // 31)
+        jd = 1 + (days % 31)
+    else:
+        jm = 7 + ((days - 186) // 30)
+        jd = 1 + ((days - 186) % 30)
+    return jy, jm, jd
+
+def parse_and_format_date(date_str: str) -> str:
+    """رشته تاریخ ISO (مثل 2023-04-10T15:45:30Z) را به شمسی تبدیل می‌کند."""
+    if not date_str:
+        return ""
+    try:
+        date_part = date_str.split("T")[0]
+        y, m, d = map(int, date_part.split("-"))
+        jy, jm, jd = gregorian_to_jalali(y, m, d)
+        return f"{jy:04d}/{jm:02d}/{jd:02d}"
+    except Exception:
+        return str(date_str).split("T")[0]
 
 
 # ===========================================================
@@ -201,14 +238,14 @@ def build_http_session() -> requests.Session:
 _ARTICLE_ID_RE = re.compile(r"/articles/(\d+)")
 
 
-def parse_listings_html(html: str, base_url: str) -> List[Listing]:
+def parse_listings_html(html_content: str, base_url: str) -> List[Listing]:
     """
     لینک مقاله‌ها را از HTML صفحه‌ی بخش (Section) زندسک بیرون می‌کشد.
     به‌جای تکیه بر اسم کلاس‌های قالب، همه‌ی لینک‌های /articles/<id> را می‌گیرد؛
     شناسه‌ی عددی داخل URL کلید یکتای ماست (و با گذر زمان بزرگ‌تر می‌شود).
     خروجی به ترتیب نمایش در صفحه (جدیدترین اول) و بدون تکرار است.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html_content, "html.parser")
     container = soup.select_one("ul.article-list") or soup.select_one("main") or soup
 
     listings: List[Listing] = []
@@ -222,9 +259,18 @@ def parse_listings_html(html: str, base_url: str) -> List[Listing]:
         if article_id in seen_ids:
             continue
         seen_ids.add(article_id)
+        
+        # پیدا کردن تگ زمان در صورت وجود در ساختار HTML
+        date_str = ""
+        li = a.find_parent("li")
+        if li:
+            time_tag = li.find("time")
+            if time_tag and time_tag.has_attr("datetime"):
+                date_str = parse_and_format_date(time_tag["datetime"])
+
         full = urljoin(base_url, a["href"])
         clean_url = full.split("#")[0].split("?")[0]
-        listings.append(Listing(article_id, title, clean_url))
+        listings.append(Listing(article_id, title, clean_url, date_str))
 
     if not listings:
         raise ParseError("هیچ مقاله‌ای در صفحه پیدا نشد (احتمالاً ساختار صفحه یا بلاک شدن)")
@@ -249,8 +295,18 @@ def _fetch_via_api(session: requests.Session, section_url: str) -> List[Listing]
     if resp.status_code != 200:
         raise FetchError(f"API HTTP {resp.status_code}")
     articles = resp.json().get("articles", [])
-    listings = [Listing(int(a["id"]), str(a["title"]).strip(), str(a["html_url"]).split("?")[0])
-                for a in articles if a.get("id") and a.get("title") and a.get("html_url")]
+    
+    listings = []
+    for a in articles:
+        if a.get("id") and a.get("title") and a.get("html_url"):
+            dt = parse_and_format_date(str(a.get("created_at", "")))
+            listings.append(Listing(
+                int(a["id"]), 
+                str(a["title"]).strip(), 
+                str(a["html_url"]).split("?")[0],
+                dt
+            ))
+            
     if not listings:
         raise ParseError("API مقاله‌ای برنگرداند")
     return listings
@@ -413,6 +469,7 @@ def format_message(listing: Listing, section: Section, html_mode: bool = True) -
 
         <عنوان خبر>
 
+        تاریخ: ...
         دسته‌بندی: ...        (فقط لیستینگ‌ها)
         نماد: ...             (فقط لیستینگ‌ها)
 
@@ -425,24 +482,32 @@ def format_message(listing: Listing, section: Section, html_mode: bool = True) -
         head = f"{section.emoji} <b>{section.title}</b>" if section.emoji else f"<b>{section.title}</b>"
         link = f'<a href="{html.escape(listing.url, quote=True)}">مشاهده‌ی جزئیات</a>'
         sym_fmt = lambda x: f"<code>{html.escape(x)}</code>"
+        date_fmt = lambda x: f"📅 <b>تاریخ:</b> {x}"
     else:  # متن ساده‌ی اضطراری: تگ‌های ایموجی حذف و فقط خود ایموجی می‌ماند
         esc = lambda x: x
         plain_emoji = re.sub(r"<[^>]+>", "", section.emoji)
         head = f"{plain_emoji} {section.title}".strip()
         link = f"مشاهده‌ی جزئیات:\n{listing.url}"
         sym_fmt = lambda x: x
+        date_fmt = lambda x: f"📅 تاریخ: {x}"
 
     blocks = [head, esc(listing.title)]
+    
+    details = []
+    if listing.date_str:
+        details.append(date_fmt(listing.date_str))
+        
     if section.detailed:
-        details = []
         category = detect_categories(listing.title)
         if category:
             details.append(f"دسته‌بندی: {category}")
         symbols = detect_symbols(listing.title)
         if symbols:
             details.append("نماد: " + "، ".join(sym_fmt(x) for x in symbols))
-        if details:
-            blocks.append("\n".join(details))
+            
+    if details:
+        blocks.append("\n".join(details))
+        
     blocks += [link, section.hashtag]
     return "\n\n".join(blocks)
 
