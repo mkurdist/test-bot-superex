@@ -491,7 +491,7 @@ def format_message(listing: Listing, section: Section, html_mode: bool = True) -
         sym_fmt = lambda x: x
         date_fmt = lambda x: f"📅 تاریخ: {x}"
 
-    blocks = [head, esc(listing.title)]
+    blocks = [head, f"\u200F{esc(listing.title)}"]
     
     details = []
     if listing.date_str:
@@ -503,7 +503,7 @@ def format_message(listing: Listing, section: Section, html_mode: bool = True) -
             details.append(f"دسته‌بندی: {category}")
         symbols = detect_symbols(listing.title)
         if symbols:
-            details.append("نماد: " + "، ".join(sym_fmt(x) for x in symbols))
+            details.append(f"\u200Fنماد: " + "، ".join(sym_fmt(x) for x in symbols))
             
     if details:
         blocks.append("\n".join(details))
