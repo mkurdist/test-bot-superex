@@ -5,7 +5,7 @@ group_tools.py
 ماژول ایزوله برای ۲ قابلیت مدیریت گروه:
 
     1) آمار فعالیت اعضا (۱، ۷ و ۳۰ روز گذشته)
-       - شمارش پیام هر عضو در حافظه و ذخیره‌ی دسته‌ای در SQLite
+       - شمارش پیام هر عضو در حافظه و ذخیره‌ی دسته‌ای در Supabase / SQLite
        - دستور دستی /stats یا «آمار»، «امار 1»، «آمار 30» و... (فقط ادمین‌ها)
        - ارسال خودکار روزانه (اختیاری، با STATS_AUTO_TIME)
 
@@ -143,8 +143,19 @@ def _now_tehran() -> datetime:
 
 
 # ===========================================================
-# SQLite (sync) + اجرای آن در thread تا event loop بلاک نشود
+# Supabase & SQLite Helpers
 # ===========================================================
+def _use_supabase() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+def _supabase_headers(prefer: Optional[str] = None) -> dict:
+    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    if SUPABASE_KEY.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
 _db_lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
 
@@ -173,6 +184,29 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _flush_sync(counts: Dict[Tuple[int, int, str], int], names: Dict[Tuple[int, int], Tuple[str, int]]) -> None:
+    if _use_supabase():
+        # آپدیت نام کاربری در Supabase (جدول group_users)
+        if names:
+            rows_users = [{"chat_id": c, "user_id": u, "name": nm, "is_channel": bool(ch)} for (c, u), (nm, ch) in names.items()]
+            for i in range(0, len(rows_users), 500):
+                requests.post(f"{SUPABASE_URL}/rest/v1/group_users?on_conflict=chat_id,user_id",
+                              json=rows_users[i:i + 500], headers=_supabase_headers("resolution=merge-duplicates,return=minimal"))
+        
+        # آپدیت تعداد پیام‌ها در Supabase (جدول msg_counts)
+        if counts:
+            for (c, u, d), n in counts.items():
+                url = f"{SUPABASE_URL}/rest/v1/msg_counts"
+                resp = requests.get(url, params={"chat_id": f"eq.{c}", "user_id": f"eq.{u}", "day": f"eq.{d}", "select": "cnt"}, headers=_supabase_headers())
+                old_cnt = 0
+                if resp.status_code == 200 and resp.json():
+                    old_cnt = resp.json()[0].get("cnt", 0)
+                new_cnt = old_cnt + n
+                requests.post(f"{url}?on_conflict=chat_id,user_id,day", 
+                              json={"chat_id": c, "user_id": u, "day": d, "cnt": new_cnt}, 
+                              headers=_supabase_headers("resolution=merge-duplicates,return=minimal"))
+        return
+
+    # روش دیتابیس محلی (SQLite)
     with _db_lock:
         conn = _get_conn()
         conn.executemany(
@@ -189,6 +223,47 @@ def _flush_sync(counts: Dict[Tuple[int, int, str], int], names: Dict[Tuple[int, 
 
 
 def _query_top_sync(chat_id: int, since_day: str, limit: int) -> List[Tuple[int, int, str, int]]:
+    if _use_supabase():
+        counts_url = f"{SUPABASE_URL}/rest/v1/msg_counts"
+        all_counts = []
+        offset = 0
+        while True:
+            resp = requests.get(counts_url, params={"chat_id": f"eq.{chat_id}", "day": f"gte.{since_day}", "select": "user_id,cnt", "limit": "1000", "offset": str(offset)}, headers=_supabase_headers())
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            all_counts.extend(data)
+            if len(data) < 1000:
+                break
+            offset += 1000
+
+        user_totals = {}
+        for row in all_counts:
+            u = int(row["user_id"])
+            user_totals[u] = user_totals.get(u, 0) + int(row["cnt"])
+
+        if not user_totals:
+            return []
+
+        top_users = sorted(user_totals.items(), key=lambda x: x[1], reverse=True)[:limit]
+        top_user_ids = [u for u, _ in top_users]
+
+        users_url = f"{SUPABASE_URL}/rest/v1/group_users"
+        u_ids_str = ",".join(map(str, top_user_ids))
+        user_info = {}
+        if top_user_ids:
+            resp_users = requests.get(users_url, params={"chat_id": f"eq.{chat_id}", "user_id": f"in.({u_ids_str})", "select": "user_id,name,is_channel"}, headers=_supabase_headers())
+            if resp_users.status_code == 200:
+                for r in resp_users.json():
+                    user_info[int(r["user_id"])] = (r.get("name") or "", 1 if r.get("is_channel") else 0)
+
+        result = []
+        for u, total in top_users:
+            name, is_chan = user_info.get(u, ("", 0))
+            result.append((u, total, name, is_chan))
+        return result
+
+    # روش دیتابیس محلی (SQLite)
     with _db_lock:
         cur = _get_conn().execute(
             "SELECT m.user_id, SUM(m.cnt) AS total, COALESCE(u.name, ''), COALESCE(u.is_channel, 0) "
@@ -201,12 +276,35 @@ def _query_top_sync(chat_id: int, since_day: str, limit: int) -> List[Tuple[int,
 
 
 def _active_chats_sync(since_day: str) -> List[int]:
+    if _use_supabase():
+        url = f"{SUPABASE_URL}/rest/v1/msg_counts"
+        chat_ids = set()
+        offset = 0
+        while True:
+            resp = requests.get(url, params={"day": f"gte.{since_day}", "select": "chat_id", "limit": "1000", "offset": str(offset)}, headers=_supabase_headers())
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            for r in data:
+                chat_ids.add(int(r["chat_id"]))
+            if len(data) < 1000:
+                break
+            offset += 1000
+        return list(chat_ids)
+
+    # روش دیتابیس محلی (SQLite)
     with _db_lock:
         cur = _get_conn().execute("SELECT DISTINCT chat_id FROM msg_counts WHERE day >= ?", (since_day,))
         return [r[0] for r in cur.fetchall()]
 
 
 def _prune_sync(before_day: str) -> None:
+    if _use_supabase():
+        url = f"{SUPABASE_URL}/rest/v1/msg_counts"
+        requests.delete(url, params={"day": f"lt.{before_day}"}, headers=_supabase_headers())
+        return
+
+    # روش دیتابیس محلی (SQLite)
     with _db_lock:
         conn = _get_conn()
         conn.execute("DELETE FROM msg_counts WHERE day < ?", (before_day,))
@@ -214,12 +312,28 @@ def _prune_sync(before_day: str) -> None:
 
 
 def _meta_get_sync(key: str) -> Optional[str]:
+    if _use_supabase():
+        url = f"{SUPABASE_URL}/rest/v1/group_meta"
+        resp = requests.get(url, params={"k": f"eq.{key}", "select": "v"}, headers=_supabase_headers())
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                return data[0].get("v")
+        return None
+
+    # روش دیتابیس محلی (SQLite)
     with _db_lock:
         row = _get_conn().execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
         return row[0] if row else None
 
 
 def _meta_set_sync(key: str, value: str) -> None:
+    if _use_supabase():
+        url = f"{SUPABASE_URL}/rest/v1/group_meta"
+        requests.post(f"{url}?on_conflict=k", json={"k": key, "v": value}, headers=_supabase_headers("resolution=merge-duplicates,return=minimal"))
+        return
+
+    # روش دیتابیس محلی (SQLite)
     with _db_lock:
         conn = _get_conn()
         conn.execute("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, value))
@@ -249,19 +363,6 @@ _selfchecked = False
 _force_channel_id: Optional[int] = None
 _member_buf: Dict[int, dict] = {}                 # user_id -> آخرین ردیف برای نوشتن
 _member_last: Dict[int, Tuple[bool, float]] = {}  # برای جلوگیری از نوشتن تکراریِ یک وضعیت
-
-
-def _use_supabase() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
-
-
-def _supabase_headers(prefer: Optional[str] = None) -> dict:
-    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
-    if SUPABASE_KEY.startswith("eyJ"):        # کلید قدیمی JWT؛ کلیدهای جدید sb_secret_ فقط apikey می‌خواهند
-        headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
-    if prefer:
-        headers["Prefer"] = prefer
-    return headers
 
 
 def _parse_ts(value: str) -> float:
