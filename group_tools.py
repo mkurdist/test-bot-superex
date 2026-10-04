@@ -638,10 +638,10 @@ async def _enforce_join(message: types.Message, user: types.User) -> None:
 
     name = html.escape(user.full_name[:30])
     text = (
-        f"⚠️ <a href='tg://user?id={user.id}'>{name}</a> عزیز، برای ارسال پیام در گروه "
-        f"باید ابتدا در کانال رسمی ما عضو شوید.\n\n"
-        f"بعد از عضویت روی دکمه «عضو شدم» بزنید."
-    )
+    f"\u200F⚠️ <a href='tg://user?id={user.id}'>{name}</a> جناب، برای ارسال پیام در گروه "
+    f"باید ابتدا در کانال رسمی ما عضو شوید.\n\n"
+    f"بعد از عضویت روی دکمه «عضو شدم» بزنید."
+)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="عضویت در کانال 📢", url=FORCE_CHANNEL_URL),
         InlineKeyboardButton(text="✅ عضو شدم", callback_data=JoinCheckCallback(user_id=user.id).pack()),
