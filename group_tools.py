@@ -18,6 +18,10 @@ group_tools.py
 
 متغیرهای محیطی (همه اختیاری):
     FORCE_JOIN_ENABLED   = 1 / 0                     (پیش‌فرض 1)
+    FORCE_JOIN_MODE      = enforce / log             (پیش‌فرض enforce؛ log = فقط ثبت، بدون حذف و هشدار)
+    FORCE_JOIN_WARMUP    = 0                         (اختیاری: ثانیه‌های اول بعد از استارت فقط ثبت شود، بعد اجبار)
+    MEMBER_CACHE_TTL     = 21600                     (اعتبار تأیید عضویت به ثانیه؛ بعدش یک بار دوباره چک می‌شود)
+    MEMBERS_TABLE        = channel_members           (جدول Supabase؛ با SUPABASE_URL و SUPABASE_KEY)
     FORCE_JOIN_CHANNEL   = @SuperExNews_Iran         (یوزرنیم یا آیدی عددی کانال)
     FORCE_JOIN_URL       = https://t.me/...          (فقط اگر کانال خصوصی است)
     GROUP_IDS            = -1001234,-1005678         (خالی = همه‌ی گروه‌هایی که ربات در آن‌هاست)
@@ -32,12 +36,14 @@ import asyncio
 import html
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
+import requests
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
 from aiogram.filters.callback_data import CallbackData
@@ -54,8 +60,14 @@ group_router = Router(name="group_tools_router")
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))  # ایران ساعت تابستانی ندارد
 
 FORCE_JOIN_ENABLED = os.getenv("FORCE_JOIN_ENABLED", "1").strip() not in ("0", "false", "False", "")
+FORCE_JOIN_MODE = os.getenv("FORCE_JOIN_MODE", "enforce").strip().lower()      # enforce | log
+FORCE_JOIN_WARMUP = int(os.getenv("FORCE_JOIN_WARMUP", "0"))                   # ثانیه
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+MEMBERS_TABLE = os.getenv("MEMBERS_TABLE", "channel_members").strip()
 _raw_channel = os.getenv("FORCE_JOIN_CHANNEL", "@SuperExNews_Iran").strip()
 FORCE_CHANNEL = int(_raw_channel) if _raw_channel.lstrip("-").isdigit() else _raw_channel
+CHANNEL_KEY = str(FORCE_CHANNEL).lower()   # داخل جدول ثبت می‌شود تا با عوض شدن کانال، دیتای کانال قبلی باور نشود
 FORCE_CHANNEL_URL = os.getenv("FORCE_JOIN_URL") or (
     f"https://t.me/{_raw_channel.lstrip('@')}" if not _raw_channel.lstrip("-").isdigit() else "https://t.me/SuperExNews_Iran"
 )
@@ -149,6 +161,13 @@ def _get_conn() -> sqlite3.Connection:
             chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, name TEXT,
             is_channel INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chat_id, user_id))""")
         _conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+        _conn.execute("""CREATE TABLE IF NOT EXISTS channel_members (
+            user_id INTEGER PRIMARY KEY, is_member INTEGER NOT NULL, full_name TEXT,
+            username TEXT, source TEXT, checked_at TEXT, channel TEXT)""")
+        try:                                          # دیتابیس‌های محلیِ قدیمی بدون ستون channel
+            _conn.execute("ALTER TABLE channel_members ADD COLUMN channel TEXT")
+        except sqlite3.OperationalError:
+            pass
         _conn.commit()
     return _conn
 
@@ -219,6 +238,148 @@ def _record(chat_id: int, user_id: int, name: str, is_channel: bool) -> None:
     key = (chat_id, user_id, day)
     _buf_counts[key] = _buf_counts.get(key, 0) + 1
     _buf_names[(chat_id, user_id)] = (name[:60], 1 if is_channel else 0)
+
+
+# ----- جدول وضعیت عضویت کاربران در کانال (Supabase؛ در نبودش SQLite محلی) -----
+_started_at = time.time()
+_enforce_announced = False
+_cache_loaded = False
+_last_load_try = 0.0
+_selfchecked = False
+_force_channel_id: Optional[int] = None
+_member_buf: Dict[int, dict] = {}                 # user_id -> آخرین ردیف برای نوشتن
+_member_last: Dict[int, Tuple[bool, float]] = {}  # برای جلوگیری از نوشتن تکراریِ یک وضعیت
+
+
+def _use_supabase() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def _supabase_headers(prefer: Optional[str] = None) -> dict:
+    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    if SUPABASE_KEY.startswith("eyJ"):        # کلید قدیمی JWT؛ کلیدهای جدید sb_secret_ فقط apikey می‌خواهند
+        headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _parse_ts(value: str) -> float:
+    """زمان ISO را به timestamp تبدیل می‌کند (۰ اگر نامعتبر)."""
+    try:
+        text = re.sub(r"(\.\d+)", lambda m: (m.group(1) + "000000")[:7], str(value).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _remember_member(user_id: int, full_name: str, username: Optional[str], is_member: bool, source: str) -> None:
+    """وضعیت عضویت را در بافر می‌گذارد (نوشتن واقعی دسته‌ای و در پس‌زمینه است)."""
+    now = time.time()
+    last = _member_last.get(user_id)
+    if source == "check" and last and last[0] == is_member and now - last[1] < 300:
+        return
+    _member_last[user_id] = (is_member, now)
+    _member_buf[user_id] = {
+        "user_id": user_id,
+        "is_member": is_member,
+        "full_name": (full_name or "")[:80],
+        "username": username or "",
+        "source": source,
+        "channel": CHANNEL_KEY,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _members_write_sync(rows: List[dict]) -> None:
+    if _use_supabase():
+        for i in range(0, len(rows), 500):
+            resp = requests.post(
+                f"{SUPABASE_URL}/rest/v1/{MEMBERS_TABLE}?on_conflict=user_id",
+                json=rows[i:i + 500], headers=_supabase_headers("resolution=merge-duplicates,return=minimal"),
+                timeout=(10, 20))
+            if resp.status_code >= 300:
+                raise RuntimeError(f"Supabase HTTP {resp.status_code}: {resp.text[:200]}")
+        return
+    with _db_lock:                                   # جایگزین محلی
+        conn = _get_conn()
+        conn.executemany(
+            "INSERT INTO channel_members (user_id, is_member, full_name, username, source, checked_at, channel) "
+            "VALUES (:user_id, :is_member, :full_name, :username, :source, :checked_at, :channel) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_member=excluded.is_member, full_name=excluded.full_name, "
+            "username=excluded.username, source=excluded.source, checked_at=excluded.checked_at, "
+            "channel=excluded.channel",
+            [{**r, "is_member": 1 if r["is_member"] else 0} for r in rows],
+        )
+        conn.commit()
+
+
+def _members_load_sync(since_iso: str) -> List[Tuple[int, str]]:
+    """عضوهای تأییدشده‌ی همین کانال که تازه‌تر از since_iso بررسی شده‌اند."""
+    if _use_supabase():
+        out: List[Tuple[int, str]] = []
+        offset = 0
+        while True:
+            resp = requests.get(
+                f"{SUPABASE_URL}/rest/v1/{MEMBERS_TABLE}",
+                params={"select": "user_id,checked_at", "is_member": "eq.true", "channel": f"eq.{CHANNEL_KEY}",
+                        "checked_at": f"gte.{since_iso}", "order": "user_id.asc",
+                        "limit": "1000", "offset": str(offset)},
+                headers=_supabase_headers(), timeout=(10, 30))
+            if resp.status_code >= 300:
+                raise RuntimeError(f"Supabase HTTP {resp.status_code}: {resp.text[:200]}")
+            page = resp.json()
+            out.extend((int(r["user_id"]), str(r["checked_at"])) for r in page)
+            if len(page) < 1000 or offset >= 500000:
+                return out
+            offset += 1000
+    with _db_lock:
+        rows = _get_conn().execute(
+            "SELECT user_id, checked_at FROM channel_members WHERE is_member = 1 AND channel = ? AND checked_at >= ?",
+            (CHANNEL_KEY, since_iso)).fetchall()
+    return [(int(u), str(t)) for u, t in rows]
+
+
+async def load_member_cache() -> None:
+    """
+    بعد از هر استارت، عضوهای تازه‌تأییدشده را از دیتابیس در حافظه می‌گذارد.
+    فقط «عضو»ها را باور می‌کنیم؛ «غیرعضو» همیشه زنده از تلگرام چک می‌شود (ممکن است
+    در زمان خاموشی ربات عضو شده باشد و نباید به اشتباه اخطار بگیرد).
+    """
+    global _cache_loaded
+    since = datetime.fromtimestamp(time.time() - MEMBER_CACHE_TTL, timezone.utc).isoformat()
+    rows = await asyncio.to_thread(_members_load_sync, since)
+    now = time.time()
+    loaded = 0
+    for user_id, checked_at in rows:
+        expiry = _parse_ts(checked_at) + MEMBER_CACHE_TTL
+        # اگر در همین پروسه خبر تازه‌تری (رویداد یا چک زنده) داریم، دیتابیس را نادیده بگیر
+        if expiry > now and user_id not in _fresh_at and _member_cache.get(user_id, 0) < expiry:
+            _member_cache[user_id] = expiry
+            loaded += 1
+    _cache_loaded = True
+    logger.info(f"[group_tools] {loaded} عضو تأییدشده از دیتابیس بارگذاری شد")
+
+
+async def flush_members() -> None:
+    global _member_buf
+    if not _member_buf:
+        return
+    rows, _member_buf = list(_member_buf.values()), {}
+    try:
+        await asyncio.to_thread(_members_write_sync, rows)
+    except Exception as e:                           # گروه نباید به خاطر دیتابیس خراب شود
+        _log_throttled(f"[group_tools] ذخیره‌ی جدول اعضا ناموفق (بعداً دوباره تلاش می‌شود): {e}", key="members_write")
+        for r in rows:
+            _member_buf.setdefault(r["user_id"], r)
+
+
+def enforcement_active() -> bool:
+    """اجبار فقط در حالت enforce و بعد از پایان دوره‌ی (اختیاریِ) گرم‌کردن فعال است."""
+    return FORCE_JOIN_MODE == "enforce" and (time.time() - _started_at) >= FORCE_JOIN_WARMUP
 
 
 async def flush_buffers() -> None:
@@ -357,17 +518,18 @@ class JoinCheckCallback(CallbackData, prefix="fj"):
     user_id: int
 
 
-_member_cache: Dict[int, float] = {}                 # user_id -> expiry (فقط عضوها)
+_member_cache: Dict[int, float] = {}                 # user_id -> زمان انقضای تأیید (فقط عضوها)
+_fresh_at: Dict[int, float] = {}                     # آخرین لحظه‌ای که از منبع معتبر (رویداد/چک زنده) خبر داریم
 _exempt_cache: Dict[Tuple[int, int], float] = {}     # (chat_id, user_id) -> expiry (ادمین‌ها)
 _warn_ts: Dict[Tuple[int, int], float] = {}
 _bg_tasks: Set[asyncio.Task] = set()
-_last_error_log = 0.0
+_last_log: Dict[str, float] = {}
 
 
-def _log_throttled(msg: str) -> None:
-    global _last_error_log
-    if time.time() - _last_error_log > 300:
-        _last_error_log = time.time()
+def _log_throttled(msg: str, key: str = "default", every: int = 300) -> None:
+    """هر نوع خطا حداکثر هر ۵ دقیقه یک بار در لاگ می‌آید."""
+    if time.time() - _last_log.get(key, 0) > every:
+        _last_log[key] = time.time()
         logger.error(msg)
 
 
@@ -380,6 +542,8 @@ def _status_is_member(cm) -> bool:
 
 def _is_force_channel(chat) -> bool:
     """آیا این چت همان کانال عضویت اجباری است؟"""
+    if _force_channel_id is not None and chat.id == _force_channel_id:
+        return True
     if isinstance(FORCE_CHANNEL, int):
         return chat.id == FORCE_CHANNEL
     return (chat.username or "").lower() == FORCE_CHANNEL.lstrip("@").lower()
@@ -390,17 +554,25 @@ async def on_channel_member_update(event: types.ChatMemberUpdated):
     """
     تلگرام خودش هر بار کسی وارد/خارج کانال شود این رویداد را می‌فرستد (بدون هیچ فشار اضافه).
     ربات باید ادمین کانال باشد و "chat_member" در allowed_updates باشد.
+    رویداد معتبرترین منبع است: هم حافظه و هم دیتابیس را فوراً به‌روز می‌کند.
     """
     if not FORCE_JOIN_ENABLED or not _is_force_channel(event.chat):
         return
-    user_id = event.new_chat_member.user.id
-    if _status_is_member(event.new_chat_member):
-        _member_cache[user_id] = time.time() + MEMBER_CACHE_TTL
+    member_user = event.new_chat_member.user
+    if member_user.is_bot:
+        return
+    user_id = member_user.id
+    is_member = _status_is_member(event.new_chat_member)
+    now = time.time()
+    _fresh_at[user_id] = now
+    _remember_member(user_id, member_user.full_name, member_user.username, is_member, "event")
+    if is_member:
+        _member_cache[user_id] = now + MEMBER_CACHE_TTL
         logger.info(f"[group_tools] {user_id} عضو کانال شد")
     else:
         _member_cache.pop(user_id, None)
         _exempt_cache_clear_user(user_id)
-        logger.info(f"[group_tools] {user_id} از کانال خارج شد؛ از لیست مجازها حذف شد")
+        logger.info(f"[group_tools] {user_id} از کانال خارج شد")
 
 
 def _exempt_cache_clear_user(user_id: int) -> None:
@@ -408,20 +580,29 @@ def _exempt_cache_clear_user(user_id: int) -> None:
         _exempt_cache.pop(key, None)
 
 
-async def is_channel_member(bot: Bot, user_id: int, use_cache: bool = True) -> Optional[bool]:
+async def is_channel_member(bot: Bot, user_id: int, use_cache: bool = True,
+                            user: Optional[types.User] = None) -> Optional[bool]:
     """True/False، یا None اگر استعلام ممکن نبود (در این حالت کاربر را رد نمی‌کنیم)."""
-    now = time.time()
-    if use_cache and _member_cache.get(user_id, 0) > now:
+    started = time.time()
+    if use_cache and _member_cache.get(user_id, 0) > started:
         return True
     try:
         cm = await bot.get_chat_member(FORCE_CHANNEL, user_id)
     except Exception as e:
         _log_throttled(
             f"[group_tools] get_chat_member on {FORCE_CHANNEL} failed: {e} "
-            f"(ربات باید ادمین کانال باشد؛ تا آن موقع محدودیت اعمال نمی‌شود)"
-        )
+            f"(ربات باید ادمین کانال باشد؛ تا آن موقع محدودیت اعمال نمی‌شود)", key="chat_member")
         return None
+
+    # اگر در حین همین استعلام، رویداد ورود/خروج رسیده، رویداد تازه‌تر است و جواب استعلام کهنه است
+    if _fresh_at.get(user_id, 0) >= started:
+        return _member_cache.get(user_id, 0) > time.time()
+
     is_member = _status_is_member(cm)
+    now = time.time()
+    _fresh_at[user_id] = now
+    if user is not None:
+        _remember_member(user_id, user.full_name, user.username, is_member, "check")
     if is_member:
         _member_cache[user_id] = now + MEMBER_CACHE_TTL
     else:
@@ -447,7 +628,7 @@ async def _enforce_join(message: types.Message, user: types.User) -> None:
     try:
         await message.delete()
     except Exception as e:
-        _log_throttled(f"[group_tools] cannot delete message (ربات باید ادمین با دسترسی حذف پیام باشد): {e}")
+        _log_throttled(f"[group_tools] cannot delete message (ربات باید ادمین با دسترسی حذف پیام باشد): {e}", key="delete")
 
     key = (message.chat.id, user.id)
     now = time.time()
@@ -480,8 +661,11 @@ async def _passes_force_join(message: types.Message, user: types.User) -> bool:
     if _exempt_cache.get((chat_id, user.id), 0) > now:
         return True
 
-    member = await is_channel_member(bot, user.id)
+    member = await is_channel_member(bot, user.id, user=user)   # هر نفر یک بار چک و در جدول ثبت می‌شود
     if member is not False:          # True یا None (خطا => fail-open)
+        return True
+
+    if not enforcement_active():     # دقیقه‌ی گرم‌کردن / حالت log: فقط ثبت، بدون حذف و هشدار
         return True
 
     if await _is_group_admin(bot, chat_id, user.id):
@@ -497,7 +681,7 @@ async def on_join_check(query: types.CallbackQuery, callback_data: JoinCheckCall
     if query.from_user.id != callback_data.user_id:
         await query.answer("این دکمه مخصوص شما نیست.", show_alert=True)
         return
-    member = await is_channel_member(query.bot, query.from_user.id, use_cache=False)
+    member = await is_channel_member(query.bot, query.from_user.id, use_cache=False, user=query.from_user)
     if member is False:
         await query.answer("هنوز عضو کانال نشده‌اید ❌", show_alert=True)
         return
@@ -563,16 +747,57 @@ def setup_group_tools(dp: Dispatcher) -> None:
 
 
 def init_group_tools() -> None:
+    global _started_at
+    _started_at = time.time()
     _get_conn()
+    if FORCE_JOIN_ENABLED:
+        logger.info(f"[group_tools] عضویت اجباری: حالت={FORCE_JOIN_MODE}، گرم‌کردن={FORCE_JOIN_WARMUP} ثانیه، "
+                    f"اعتبار تأیید={MEMBER_CACHE_TTL} ثانیه، "
+                    f"دیتابیس={'Supabase' if _use_supabase() else 'SQLite محلی'}")
+
+
+async def _startup_selfcheck(bot: Bot) -> None:
+    """یک بار بعد از استارت: آیا ربات واقعاً ادمین کانال است؟ (نبودنش را در لاگ بلند اعلام می‌کند)"""
+    global _force_channel_id
+    try:
+        me = await bot.me()
+        chat = await bot.get_chat(FORCE_CHANNEL)
+        _force_channel_id = chat.id
+        cm = await bot.get_chat_member(FORCE_CHANNEL, me.id)
+        status = getattr(cm.status, "value", cm.status)
+        if status in ("administrator", "creator"):
+            logger.info(f"[group_tools] کانال «{chat.title}» ({chat.id}) درست است؛ ربات ادمین است")
+        else:
+            logger.error(f"[group_tools] ⚠️ ربات در کانال «{chat.title}» ادمین نیست (وضعیت: {status}). "
+                         f"بدون ادمین بودن عضویت‌ها چک نمی‌شود و رویداد ورود/خروج نمی‌رسد.")
+    except Exception as e:
+        logger.error(f"[group_tools] ⚠️ بررسی کانال {FORCE_CHANNEL} ناموفق: {e}")
 
 
 async def group_tools_background_loop(bot: Bot) -> None:
-    """ذخیره‌ی دسته‌ای شمارنده‌ها، ارسال خودکار آمار و تمیزکاری کش‌ها/دیتای قدیمی."""
+    """ذخیره‌ی دسته‌ای دیتا، بارگذاری کش عضویت، ارسال خودکار آمار و تمیزکاری."""
+    global _selfchecked, _last_load_try, _enforce_announced
     last_prune = 0.0
     while True:
         try:
+            if FORCE_JOIN_ENABLED:
+                if not _selfchecked:
+                    _selfchecked = True
+                    await _startup_selfcheck(bot)
+                if not _cache_loaded and time.time() - _last_load_try > 60:
+                    _last_load_try = time.time()
+                    try:
+                        await load_member_cache()
+                    except Exception as e:     # دیتابیس موقتاً در دسترس نیست؛ ۱ دقیقه بعد دوباره
+                        _log_throttled(f"[group_tools] بارگذاری عضوها از دیتابیس ناموفق: {e}", key="members_load", every=60)
+
             await flush_buffers()
+            await flush_members()
             await _maybe_auto_post(bot)
+
+            if FORCE_JOIN_ENABLED and not _enforce_announced and enforcement_active():
+                _enforce_announced = True
+                logger.info("[group_tools] حالت اجبار عضویت فعال است")
 
             now = time.time()
             if now - last_prune > 3600:
@@ -584,6 +809,11 @@ async def group_tools_background_loop(bot: Bot) -> None:
                     _admin_cache.pop(k, None)
                 for k in [k for k, ts in _warn_ts.items() if now - ts > 3600]:
                     _warn_ts.pop(k, None)
+                for store in (_fresh_at,):
+                    for k in [k for k, ts in store.items() if now - ts > 3600]:
+                        store.pop(k, None)
+                for k in [k for k, v in _member_last.items() if now - v[1] > 3600]:
+                    _member_last.pop(k, None)
                 old = (_now_tehran() - timedelta(days=STATS_WINDOW_DAYS + 7)).strftime("%Y-%m-%d")
                 await asyncio.to_thread(_prune_sync, old)
         except Exception as e:
@@ -593,3 +823,4 @@ async def group_tools_background_loop(bot: Bot) -> None:
 
 async def shutdown_group_tools() -> None:
     await flush_buffers()
+    await flush_members()

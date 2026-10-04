@@ -2,43 +2,39 @@
 """
 listing_monitor.py
 ---------------------------------------------------------
-مانیتور خبرهای «لیست‌های جدید» صرافی SuperEx و ارسال آن‌ها به تلگرام.
+مانیتور مرکز اطلاعیه‌های SuperEx (نسخه‌ی فارسی) و ارسال خبرها به تلگرام.
+
+چهار بخش پایش می‌شود: لیست‌های جدید، اطلاعیه‌ها، رویدادها، به‌روزرسانی/نگهداری/حذف.
 
 جریان کار:
-    ۱) صفحه‌ی New Listings مرکز پشتیبانی (Zendesk) را می‌خواند
-       (اول HTML با BeautifulSoup، و اگر شکست خورد API عمومی Zendesk).
+    ۱) هر بخش را می‌خواند (اول API عمومی Zendesk، اگر نشد HTML با BeautifulSoup).
     ۲) شناسه‌ی عددی هر مقاله را با دیتابیس «دیده‌شده‌ها» مقایسه می‌کند.
     ۳) فقط مقاله‌های جدید را به ترتیب زمانی (قدیمی به جدید) به تلگرام می‌فرستد.
     ۴) هر N ثانیه تکرار می‌کند.
 
 ضد تکرار:
-    - ذخیره‌سازی اصلی Supabase است (روی Render دیسک موقت است و فایل محلی پاک می‌شود).
-    - اگر SUPABASE_URL / SUPABASE_KEY تنظیم نشده باشد، به SQLite محلی برمی‌گردد.
-    - در اولین اجرا (دیتابیس خالی) فقط «خط پایه» ثبت می‌شود و هیچ پیام قدیمی ارسال نمی‌شود.
-    - یک خبر فقط بعد از ارسال موفق به تلگرام «دیده‌شده» ثبت می‌شود؛ پس خطای تلگرام
-      باعث گم شدن خبر نمی‌شود و دوره‌ی بعد دوباره تلاش می‌شود.
-    - اگر دیتابیس در دسترس نباشد، چیزی ارسال نمی‌شود (چون بدون دیتابیس تکراری‌ها
-      قابل تشخیص نیستند).
+    - ذخیره‌سازی اصلی Supabase است (روی Render دیسک موقت است).
+      اگر SUPABASE_URL / SUPABASE_KEY نباشد، SQLite محلی استفاده می‌شود.
+    - اگر هیچ‌کدام از مقاله‌های فعلیِ یک بخش در دیتابیس نباشد (اجرای اول یا بخش تازه)،
+      فقط «خط پایه» ثبت می‌شود و هیچ خبر قدیمی ارسال نمی‌شود.
+    - خبر فقط بعد از ارسال موفق «دیده‌شده» ثبت می‌شود.
+    - اگر دیتابیس در دسترس نباشد، چیزی ارسال نمی‌شود.
+    - خرابی یک بخش، بخش‌های دیگر را متوقف نمی‌کند.
 
 اجرا:
     python listing_monitor.py              # اجرای دائمی
-    python listing_monitor.py --once       # فقط یک بار چک کن و خارج شو
-    python listing_monitor.py --dry-run    # فقط بخوان و پیش‌نمایش پیام را چاپ کن (بدون ارسال/ذخیره)
-
-اجرا داخل پروسه‌ی main.py (اختیاری):
-    from listing_monitor import start_in_background
-    start_in_background()
+    python listing_monitor.py --once       # فقط یک بار چک کن
+    python listing_monitor.py --dry-run    # فقط بخوان و پیش‌نمایش پیام را چاپ کن
 
 متغیرهای محیطی:
-    BOT_TOKEN                توکن ربات (همان که main.py استفاده می‌کند)
-    LISTING_CHAT_ID          مقصدها با کاما جدا (کانال/گروه): @mychannel,-100123456789
-                             برای تاپیک گروه: -100123456789:55
+    BOT_TOKEN                توکن ربات
+    LISTING_CHAT_ID          مقصدها با کاما: @mychannel,-100123456789  (تاپیک: -100123456789:55)
+    LISTING_SECTIONS         بخش‌های فعال با کاما (پیش‌فرض همه): listings,announcements,events,updates
     LISTING_CHECK_INTERVAL   فاصله‌ی چک به ثانیه (پیش‌فرض 600)
-    LISTING_SOURCE_URL       (اختیاری) آدرس صفحه
-    LISTING_MAX_PER_CYCLE    سقف پیام در هر دوره (پیش‌فرض 5)
+    LISTING_MAX_PER_CYCLE    سقف پیام هر بخش در هر دوره (پیش‌فرض 5)
     LISTING_PREVIEW          1 = پیش‌نمایش لینک روشن (پیش‌فرض 0)
     SUPABASE_URL, SUPABASE_KEY, SUPABASE_TABLE (پیش‌فرض seen_listings)
-    LISTING_SQLITE_PATH      مسیر SQLite جایگزین (پیش‌فرض listing_seen.sqlite3)
+    LISTING_SQLITE_PATH      مسیر SQLite جایگزین
 ---------------------------------------------------------
 """
 
@@ -62,9 +58,29 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger("listing_monitor")
 
-DEFAULT_SOURCE_URL = "https://support.superex.com/hc/en-001/sections/4412788340249-New-Listings"
-FOOTER_CHANNEL = "https://t.me/SuperExNews_Iran"
-FOOTER_GROUP = "https://t.me/SuperexIR"
+
+# ===========================================================
+# بخش‌های پایش‌شده + ظاهر پیام
+# emoji: اینجا هر چیزی بگذارید (حتی ایموجی پریمیوم) بالای پیام می‌آید. مثال:
+#   '<tg-emoji emoji-id="5368324170671202286">🆕</tg-emoji>'
+# ===========================================================
+@dataclass(frozen=True)
+class Section:
+    key: str        # شناسه‌ی داخلی (برای LISTING_SECTIONS)
+    title: str      # تیتر پیام
+    hashtag: str    # هشتگ پایین پیام
+    url: str        # آدرس بخش در مرکز اطلاعیه‌ها (نسخه‌ی فارسی)
+    emoji: str = ""  # ایموجی کنار تیتر (خالی = بدون ایموجی)
+    detailed: bool = False  # فقط لیستینگ‌ها: نمایش دسته‌بندی و نماد
+
+
+_BASE = "https://support.superex.com/hc/fa/sections/"
+ALL_SECTIONS = (
+    Section("listings", "لیست جدید", "#لیست_جدید", _BASE + "9117167570457", detailed=True),
+    Section("announcements", "اطلاعیه", "#اطلاعیه", _BASE + "9117102988825"),
+    Section("events", "رویداد", "#رویداد", _BASE + "9117136933657"),
+    Section("updates", "به‌روزرسانی و نگهداری", "#به_روزرسانی", _BASE + "9117198982041"),
+)
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -101,11 +117,17 @@ class TelegramError(Exception):
 # ===========================================================
 # تنظیمات
 # ===========================================================
+def _pick_sections(raw: str) -> tuple:
+    wanted = {x.strip() for x in raw.split(",") if x.strip()}
+    chosen = tuple(sec for sec in ALL_SECTIONS if not wanted or sec.key in wanted)
+    return chosen or ALL_SECTIONS
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
     chat_ids: tuple  # هر عضو: (chat_id, thread_id|None)
-    source_url: str
+    sections: tuple
     interval: int
     max_per_cycle: int
     preview: bool
@@ -132,7 +154,7 @@ class Config:
         return cls(
             bot_token=os.getenv("BOT_TOKEN", "").strip(),
             chat_ids=tuple(targets),
-            source_url=os.getenv("LISTING_SOURCE_URL", DEFAULT_SOURCE_URL).strip(),
+            sections=_pick_sections(os.getenv("LISTING_SECTIONS", "")),
             interval=max(60, int(os.getenv("LISTING_CHECK_INTERVAL", "600"))),
             max_per_cycle=max(1, int(os.getenv("LISTING_MAX_PER_CYCLE", "5"))),
             preview=os.getenv("LISTING_PREVIEW", "0").strip() == "1",
@@ -219,33 +241,38 @@ def _zendesk_api_url(source_url: str) -> Optional[str]:
             f"/articles.json?sort_by=created_at&sort_order=desc&per_page=30")
 
 
-def fetch_listings(session: requests.Session, source_url: str) -> List[Listing]:
-    """اول HTML؛ اگر شکست خورد (مثلاً ۴۰۳ یا تغییر قالب) API زندسک."""
-    html_error: Exception
-    try:
-        resp = session.get(source_url, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            raise FetchError(f"HTTP {resp.status_code}")
-        return parse_listings_html(resp.text, source_url)
-    except (requests.RequestException, FetchError, ParseError) as e:
-        html_error = e
-        logger.warning(f"خواندن HTML ناموفق ({type(e).__name__}: {e}) → تلاش با API")
-
-    api_url = _zendesk_api_url(source_url)
+def _fetch_via_api(session: requests.Session, section_url: str) -> List[Listing]:
+    api_url = _zendesk_api_url(section_url)
     if not api_url:
-        raise FetchError(f"HTML ناموفق بود و API قابل ساخت نیست: {html_error}")
+        raise FetchError("آدرس API قابل ساخت نیست")
+    resp = session.get(api_url, timeout=HTTP_TIMEOUT)
+    if resp.status_code != 200:
+        raise FetchError(f"API HTTP {resp.status_code}")
+    articles = resp.json().get("articles", [])
+    listings = [Listing(int(a["id"]), str(a["title"]).strip(), str(a["html_url"]).split("?")[0])
+                for a in articles if a.get("id") and a.get("title") and a.get("html_url")]
+    if not listings:
+        raise ParseError("API مقاله‌ای برنگرداند")
+    return listings
+
+
+def _fetch_via_html(session: requests.Session, section_url: str) -> List[Listing]:
+    resp = session.get(section_url, timeout=HTTP_TIMEOUT)
+    if resp.status_code != 200:
+        raise FetchError(f"HTML HTTP {resp.status_code}")
+    return parse_listings_html(resp.text, section_url)
+
+
+def fetch_listings(session: requests.Session, section_url: str) -> List[Listing]:
+    """اول API عمومی Zendesk (روی Render جواب می‌دهد)؛ اگر شکست خورد HTML."""
     try:
-        resp = session.get(api_url, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            raise FetchError(f"API HTTP {resp.status_code}")
-        articles = resp.json().get("articles", [])
-        listings = [Listing(int(a["id"]), str(a["title"]).strip(), str(a["html_url"]).split("?")[0])
-                    for a in articles if a.get("id") and a.get("title") and a.get("html_url")]
-        if not listings:
-            raise ParseError("API هم مقاله‌ای برنگرداند")
-        return listings
-    except (requests.RequestException, ValueError, KeyError, FetchError, ParseError) as e:
-        raise FetchError(f"HTML ({html_error}) و API ({type(e).__name__}: {e}) هر دو ناموفق بودند") from e
+        return _fetch_via_api(session, section_url)
+    except (requests.RequestException, ValueError, KeyError, FetchError, ParseError) as api_error:
+        logger.warning(f"API ناموفق ({type(api_error).__name__}: {api_error}) → تلاش با HTML")
+        try:
+            return _fetch_via_html(session, section_url)
+        except (requests.RequestException, FetchError, ParseError) as html_error:
+            raise FetchError(f"API ({api_error}) و HTML ({html_error}) هر دو ناموفق بودند") from html_error
 
 
 # ===========================================================
@@ -356,59 +383,68 @@ def build_storage(cfg: Config) -> Storage:
 # بخش ۳: ساخت پیام
 # ===========================================================
 def detect_categories(title: str) -> str:
-    """دسته‌بندی را از روی کلمات کلیدی عنوان تشخیص می‌دهد."""
-    t = title.lower()
+    """دسته‌بندی را از روی کلمات کلیدیِ عنوان فارسی تشخیص می‌دهد (خالی = نامشخص)."""
     cats = []
-    if "spot" in t:
-        cats.append("🟢 اسپات (Spot)")
-    if "perpetual" in t:
-        cats.append("🔵 فیوچرز دائمی (USDT-M)")
-    if "index futures" in t:
-        cats.append("🟣 مارجین فیوچرز شاخص")
-    return " + ".join(cats) if cats else "🆕 لیست جدید"
+    if "اسپات" in title:
+        cats.append("اسپات")
+    if any(w in title for w in ("فیوچرز", "آتی", "پرپچوال", "دائمی", "USDT-M")):
+        cats.append("فیوچرز دائمی")
+    if "index futures" in title.lower():
+        cats.append("مارجین Index Futures")
+    return "، ".join(cats)
 
 
 def detect_symbols(title: str) -> List[str]:
     """نمادها را پیدا می‌کند: (MHA) داخل پرانتز، یا جفت‌های مثل CYPHUSDT."""
     found: List[str] = []
-    for s in re.findall(r"\(([A-Z0-9.\-]{2,12})\)", title) + re.findall(r"\b([A-Z0-9]{2,12}USDT)\b", title):
-        if s not in found:
-            found.append(s)
+    patterns = (r"\(([A-Z0-9.\-]{2,12})\)", r"(?<![A-Za-z0-9])([A-Z0-9]{2,12}USDT)(?![A-Za-z0-9])")
+    for pattern in patterns:
+        for sym in re.findall(pattern, title):
+            if sym not in found:
+                found.append(sym)
     return found[:6]
 
 
-def format_message(listing: Listing, html_mode: bool = True) -> str:
+def format_message(listing: Listing, section: Section, html_mode: bool = True) -> str:
     """
-    متن پیام. حالت پیش‌فرض HTML است (کم‌باگ‌تر از Markdown چون فقط < > & باید فرار داده شوند
-    و html.escape این کار را انجام می‌دهد). حالت html_mode=False متن ساده برای حالت اضطراری است.
-    """
-    esc = html.escape if html_mode else (lambda s: s)
-    b = (lambda s: f"<b>{s}</b>") if html_mode else (lambda s: s)
-    code = (lambda s: f"<code>{esc(s)}</code>") if html_mode else (lambda s: s)
+    قالب ساده و تمیز، بدون خط و تزئین اضافه:
 
-    lines = [
-        f"🆕 {b('لیست جدید در صرافی SuperEx')} 🆕",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-        f"📌 {b('عنوان خبر:')}",
-        esc(listing.title),
-        "",
-        f"🏷 {b('دسته‌بندی:')} {detect_categories(listing.title)}",
-    ]
-    symbols = detect_symbols(listing.title)
-    if symbols:
-        lines.append(f"🪙 {b('نماد:')} " + "، ".join(code(s) for s in symbols))
-    lines.append("")
+        <تیتر بخش>
+
+        <عنوان خبر>
+
+        دسته‌بندی: ...        (فقط لیستینگ‌ها)
+        نماد: ...             (فقط لیستینگ‌ها)
+
+        مشاهده‌ی جزئیات
+
+        #هشتگ
+    """
     if html_mode:
-        lines.append(f"🔗 <a href=\"{html.escape(listing.url, quote=True)}\">مشاهده‌ی جزئیات خبر</a>")
-    else:
-        lines.append(f"🔗 مشاهده‌ی جزئیات خبر:\n{listing.url}")
-    lines += ["", "━━━━━━━━━━━━━━━━━━"]
-    if html_mode:
-        lines.append(f"📢 <a href=\"{FOOTER_CHANNEL}\">کانال رسمی</a> | 👥 <a href=\"{FOOTER_GROUP}\">گروه گفتگو</a>")
-    else:
-        lines.append(f"📢 {FOOTER_CHANNEL}\n👥 {FOOTER_GROUP}")
-    return "\n".join(lines)
+        esc = html.escape
+        head = f"{section.emoji} <b>{section.title}</b>" if section.emoji else f"<b>{section.title}</b>"
+        link = f'<a href="{html.escape(listing.url, quote=True)}">مشاهده‌ی جزئیات</a>'
+        sym_fmt = lambda x: f"<code>{html.escape(x)}</code>"
+    else:  # متن ساده‌ی اضطراری: تگ‌های ایموجی حذف و فقط خود ایموجی می‌ماند
+        esc = lambda x: x
+        plain_emoji = re.sub(r"<[^>]+>", "", section.emoji)
+        head = f"{plain_emoji} {section.title}".strip()
+        link = f"مشاهده‌ی جزئیات:\n{listing.url}"
+        sym_fmt = lambda x: x
+
+    blocks = [head, esc(listing.title)]
+    if section.detailed:
+        details = []
+        category = detect_categories(listing.title)
+        if category:
+            details.append(f"دسته‌بندی: {category}")
+        symbols = detect_symbols(listing.title)
+        if symbols:
+            details.append("نماد: " + "، ".join(sym_fmt(x) for x in symbols))
+        if details:
+            blocks.append("\n".join(details))
+    blocks += [link, section.hashtag]
+    return "\n\n".join(blocks)
 
 
 # ===========================================================
@@ -426,13 +462,13 @@ class TelegramSender:
         """توکن ربات هرگز در لاگ نیاید."""
         return str(text).replace(self.cfg.bot_token, "***")
 
-    def send(self, listing: Listing) -> None:
+    def send(self, listing: Listing, section: Section) -> None:
         """به همه‌ی مقصدها می‌فرستد. فقط اگر به هیچ‌کدام نرسید خطا می‌دهد (تا خبر تکراری نشود)."""
         ok = 0
         last_error: Optional[TelegramError] = None
         for chat_id, thread_id in self.cfg.chat_ids:
             try:
-                self._send_to(listing, chat_id, thread_id)
+                self._send_to(listing, section, chat_id, thread_id)
                 ok += 1
             except TelegramError as e:
                 logger.error(f"ارسال به {chat_id} ناموفق: {e}")
@@ -440,10 +476,10 @@ class TelegramSender:
         if ok == 0:
             raise last_error or TelegramError("هیچ مقصدی تنظیم نشده")
 
-    def _send_to(self, listing: Listing, chat_id: str, thread_id: Optional[int]) -> None:
+    def _send_to(self, listing: Listing, section: Section, chat_id: str, thread_id: Optional[int]) -> None:
         payload = {
             "chat_id": chat_id,
-            "text": format_message(listing, html_mode=True),
+            "text": format_message(listing, section, html_mode=True),
             "parse_mode": "HTML",
             "disable_web_page_preview": not self.cfg.preview,
         }
@@ -476,7 +512,7 @@ class TelegramSender:
             if resp.status_code == 400 and "parse entities" in desc.lower() and "parse_mode" in payload:
                 logger.warning("خطای HTML؛ ارسال مجدد به‌صورت متن ساده")
                 payload.pop("parse_mode")
-                payload["text"] = format_message(listing, html_mode=False)
+                payload["text"] = format_message(listing, section, html_mode=False)
                 continue
             if resp.status_code >= 500:
                 STOP_EVENT.wait(2 ** attempt)
@@ -489,41 +525,52 @@ class TelegramSender:
 # ===========================================================
 # بخش ۵: یک دوره‌ی بررسی + حلقه‌ی اصلی
 # ===========================================================
-def run_once(cfg: Config, http: requests.Session, storage: Storage, sender: TelegramSender) -> int:
-    """یک دوره‌ی کامل را اجرا می‌کند و تعداد پیام‌های ارسال‌شده را برمی‌گرداند."""
-    listings = fetch_listings(http, cfg.source_url)
-    ids = [l.article_id for l in listings]
+def _process_section(section: Section, cfg: Config, http: requests.Session,
+                     storage: Storage, sender: TelegramSender) -> int:
+    """یک بخش را بررسی می‌کند و تعداد پیام‌های ارسال‌شده را برمی‌گرداند."""
+    listings = fetch_listings(http, section.url)
+    seen = storage.get_seen(l.article_id for l in listings)
 
-    # اجرای اول: فقط خط پایه را ثبت کن تا تاریخچه‌ی سایت اسپم نشود
-    if storage.is_empty():
+    # هیچ‌کدام از مقاله‌های فعلی دیده نشده => اجرای اول (یا بخش تازه): فقط خط پایه
+    if not seen:
         storage.mark_seen(listings)
-        logger.info(f"اولین اجرا: {len(listings)} خبر موجود به‌عنوان خط پایه ثبت شد (چیزی ارسال نشد)")
+        logger.info(f"[{section.key}] خط پایه ثبت شد ({len(listings)} خبر؛ چیزی ارسال نشد)")
         return 0
 
-    seen = storage.get_seen(ids)
     new = sorted((l for l in listings if l.article_id not in seen), key=lambda l: l.article_id)
     if not new:
-        logger.info("خبر جدیدی نیست")
+        logger.info(f"[{section.key}] خبر جدیدی نیست")
         return 0
 
-    # محافظ ضد اسپم: اگر ناگهان خیلی زیاد «جدید» دیدیم (مثلاً دیتابیس ریست شده)
+    # محافظ ضد اسپم: اگر ناگهان خیلی زیاد «جدید» دیدیم
     if len(new) > cfg.max_per_cycle:
         skipped, new = new[:-cfg.max_per_cycle], new[-cfg.max_per_cycle:]
-        logger.warning(f"{len(skipped) + len(new)} خبر جدید دیده شد؛ فقط {len(new)} تای آخر ارسال می‌شود")
+        logger.warning(f"[{section.key}] {len(skipped) + len(new)} خبر جدید؛ فقط {len(new)} تای آخر ارسال می‌شود")
         storage.mark_seen(skipped)
 
     sent = 0
     for listing in new:                       # قدیمی → جدید
         try:
-            sender.send(listing)
+            sender.send(listing, section)
         except TelegramError as e:
-            logger.error(f"ارسال «{listing.title[:60]}» ناموفق: {e} — دوره‌ی بعد دوباره تلاش می‌شود")
+            logger.error(f"[{section.key}] ارسال «{listing.title[:60]}» ناموفق: {e} — دوره‌ی بعد دوباره تلاش می‌شود")
             break                             # ترتیب خبرها به‌هم نریزد
         storage.mark_seen([listing])          # فقط بعد از ارسال موفق
         sent += 1
-        STOP_EVENT.wait(1.5)                  # فاصله‌ی کوتاه بین پیام‌ها
-    logger.info(f"{sent} پیام ارسال شد")
+        STOP_EVENT.wait(1.5)
+    logger.info(f"[{section.key}] {sent} پیام ارسال شد")
     return sent
+
+
+def run_once(cfg: Config, http: requests.Session, storage: Storage, sender: TelegramSender) -> int:
+    """همه‌ی بخش‌ها را می‌گردد. خرابی یک بخش بقیه را متوقف نمی‌کند."""
+    total = 0
+    for section in cfg.sections:
+        try:
+            total += _process_section(section, cfg, http, storage, sender)
+        except (FetchError, ParseError) as e:
+            logger.warning(f"[{section.key}] دریافت خبرها ناموفق: {e}")
+    return total
 
 
 def run_forever(cfg: Optional[Config] = None) -> None:
@@ -537,8 +584,6 @@ def run_forever(cfg: Optional[Config] = None) -> None:
     while not STOP_EVENT.is_set():
         try:
             run_once(cfg, http, storage, sender)
-        except (FetchError, ParseError) as e:
-            logger.warning(f"دریافت خبرها ناموفق: {e}")
         except StorageError as e:
             logger.error(f"دیتابیس در دسترس نیست؛ این دوره رد شد: {e}")
         except Exception:
@@ -558,12 +603,16 @@ def start_in_background() -> threading.Thread:
 # CLI
 # ===========================================================
 def _dry_run(cfg: Config) -> None:
-    listings = fetch_listings(build_http_session(), cfg.source_url)
-    print(f"{len(listings)} خبر پیدا شد. ۳ مورد اول:")
-    for l in listings[:3]:
-        print(f"  [{l.article_id}] {l.title}\n      {l.url}")
-    print("\n--- پیش‌نمایش پیام برای جدیدترین خبر ---\n")
-    print(format_message(max(listings, key=lambda l: l.article_id), html_mode=False))
+    http = build_http_session()
+    for section in cfg.sections:
+        print(f"\n===== {section.key} =====")
+        try:
+            listings = fetch_listings(http, section.url)
+        except (FetchError, ParseError) as e:
+            print(f"خطا: {e}")
+            continue
+        print(f"{len(listings)} خبر پیدا شد. پیش‌نمایش جدیدترین خبر:\n")
+        print(format_message(max(listings, key=lambda l: l.article_id), section, html_mode=False))
 
 
 def main() -> None:
