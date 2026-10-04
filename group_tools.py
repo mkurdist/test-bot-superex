@@ -638,7 +638,7 @@ async def _enforce_join(message: types.Message, user: types.User) -> None:
 
     name = html.escape(user.full_name[:30])
     text = (
-    f"\u200F⚠️ <a href='tg://user?id={user.id}'>{name}</a> جناب، برای ارسال پیام در گروه "
+    f"جناب <a href='tg://user?id={user.id}'>{name}</a>، برای ارسال پیام در گروه "
     f"باید ابتدا در کانال رسمی ما عضو شوید.\n\n"
     f"بعد از عضویت روی دکمه «عضو شدم» بزنید."
 )
