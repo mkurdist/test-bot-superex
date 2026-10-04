@@ -4,9 +4,9 @@ group_tools.py
 ---------------------------------------------------------
 ماژول ایزوله برای ۲ قابلیت مدیریت گروه:
 
-    1) آمار فعالیت اعضا (۷ روز گذشته)
+    1) آمار فعالیت اعضا (۱، ۷ و ۳۰ روز گذشته)
        - شمارش پیام هر عضو در حافظه و ذخیره‌ی دسته‌ای در SQLite
-       - دستور دستی  /stats  یا  «آمار»  (فقط ادمین‌ها)
+       - دستور دستی /stats یا «آمار»، «امار 1»، «آمار 30» و... (فقط ادمین‌ها)
        - ارسال خودکار روزانه (اختیاری، با STATS_AUTO_TIME)
 
     2) عضویت اجباری کانال
@@ -399,14 +399,16 @@ async def flush_buffers() -> None:
             _buf_names.setdefault(k, v)
 
 
-def _build_stats_text(rows: List[Tuple[int, int, str, int]]) -> str:
+def _build_stats_text(rows: List[Tuple[int, int, str, int]], days: int) -> str:
     now = _now_tehran()
     jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
     date_str = fa_digits(f"{jd:02d} {_FA_MONTHS[jm - 1]} {jy}")
     time_str = fa_digits(now.strftime("%H:%M:%S"))
 
+    title_day = "امروز" if days == 1 else f"{fa_digits(days)} روز گذشته"
+
     head = [
-        f"➖ <b>آمار کل فعالیت های {fa_digits(STATS_WINDOW_DAYS)} روز گذشته</b>",
+        f"➖ <b>آمار کل فعالیت های {title_day}</b>",
         "",
         f"• {_FA_WEEKDAYS[now.weekday()]}: {date_str}",
         f"• ساعت : {time_str}",
@@ -425,13 +427,13 @@ def _build_stats_text(rows: List[Tuple[int, int, str, int]]) -> str:
     return text
 
 
-async def build_stats_for_chat(chat_id: int) -> Optional[str]:
+async def build_stats_for_chat(chat_id: int, days: int = STATS_WINDOW_DAYS) -> Optional[str]:
     await flush_buffers()
-    since = (_now_tehran() - timedelta(days=STATS_WINDOW_DAYS - 1)).strftime("%Y-%m-%d")
+    since = (_now_tehran() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     rows = await asyncio.to_thread(_query_top_sync, chat_id, since, STATS_TOP_N)
     if not rows:
         return None
-    return _build_stats_text(rows)
+    return _build_stats_text(rows, days)
 
 
 _admin_cache: Dict[Tuple[int, int], Tuple[float, bool]] = {}
@@ -454,7 +456,7 @@ async def _is_group_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 @group_router.message(Command("stats"))
-@group_router.message(F.text == "آمار")
+@group_router.message(F.text.regexp(r"^(آمار|امار)\s*(\d+)?$"))
 async def handle_stats_command(message: types.Message):
     chat = message.chat
     if chat.type not in ("group", "supergroup") or not _chat_allowed(chat.id):
@@ -465,7 +467,20 @@ async def handle_stats_command(message: types.Message):
     )
     if not is_admin:
         return  # Silent
-    text = await build_stats_for_chat(chat.id)
+        
+    days = STATS_WINDOW_DAYS
+    if message.text:
+        text_clean = message.text.strip()
+        if text_clean.startswith("/stats"):
+            parts = text_clean.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                days = int(parts[1])
+        else:
+            match = re.match(r"^(?:آمار|امار)\s*(\d+)?$", text_clean)
+            if match and match.group(1):
+                days = int(match.group(1))
+
+    text = await build_stats_for_chat(chat.id, days)
     if text:
         await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -504,7 +519,7 @@ async def _maybe_auto_post(bot: Bot) -> None:
         if not _chat_allowed(chat_id):
             continue
         try:
-            text = await build_stats_for_chat(chat_id)
+            text = await build_stats_for_chat(chat_id, STATS_WINDOW_DAYS)
             if text:
                 await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
@@ -552,7 +567,7 @@ def _is_force_channel(chat) -> bool:
 @group_router.chat_member()
 async def on_channel_member_update(event: types.ChatMemberUpdated):
     """
-    تلگرام خودش هر بار کسی وارد/خارج کانال شود این رویداد را می‌فرستد (بدون هیچ فشار اضافه).
+    تلگرام خودش هر بار کسی وارد/خارج کانال شود این رویداد را می‌‌فرستد (بدون هیچ فشار اضافه).
     ربات باید ادمین کانال باشد و "chat_member" در allowed_updates باشد.
     رویداد معتبرترین منبع است: هم حافظه و هم دیتابیس را فوراً به‌روز می‌کند.
     """
@@ -582,7 +597,7 @@ def _exempt_cache_clear_user(user_id: int) -> None:
 
 async def is_channel_member(bot: Bot, user_id: int, use_cache: bool = True,
                             user: Optional[types.User] = None) -> Optional[bool]:
-    """True/False، یا None اگر استعلام ممکن نبود (در این حالت کاربر را رد نمی‌کنیم)."""
+    """True/False، یا None اگر استعلام ممکن نبود (در این حالت کاربر را رد نمی‌‌کنیم)."""
     started = time.time()
     if use_cache and _member_cache.get(user_id, 0) > started:
         return True
@@ -694,7 +709,7 @@ async def on_join_check(query: types.CallbackQuery, callback_data: JoinCheckCall
 
 # ===========================================================
 # Middleware: برای هر پیام گروه، اول عضویت چک می‌شود، بعد شمارش
-# (Middleware است تا بقیه‌ی هندلرهای ربات مثل قیمت/چارت دست‌نخورده کار کنند)
+# (Middleware است تا بقیه‌ی هندلرهای ربات مثل قیمت/چارت دست‌‌نخورده کار کنند)
 # ===========================================================
 def _is_service_message(message: types.Message) -> bool:
     ct = getattr(message.content_type, "value", message.content_type)
@@ -769,7 +784,7 @@ async def _startup_selfcheck(bot: Bot) -> None:
             logger.info(f"[group_tools] کانال «{chat.title}» ({chat.id}) درست است؛ ربات ادمین است")
         else:
             logger.error(f"[group_tools] ⚠️ ربات در کانال «{chat.title}» ادمین نیست (وضعیت: {status}). "
-                         f"بدون ادمین بودن عضویت‌ها چک نمی‌شود و رویداد ورود/خروج نمی‌رسد.")
+                         f"بدون ادمین بودن عضویت‌ها چک نمی‌‌شود و رویداد ورود/خروج نمی‌رسد.")
     except Exception as e:
         logger.error(f"[group_tools] ⚠️ بررسی کانال {FORCE_CHANNEL} ناموفق: {e}")
 
@@ -814,7 +829,9 @@ async def group_tools_background_loop(bot: Bot) -> None:
                         store.pop(k, None)
                 for k in [k for k, v in _member_last.items() if now - v[1] > 3600]:
                     _member_last.pop(k, None)
-                old = (_now_tehran() - timedelta(days=STATS_WINDOW_DAYS + 7)).strftime("%Y-%m-%d")
+                
+                # نگهداری اطلاعات آمار دیتابیس تا ۴۰۰ روز (برای پشتیبانی از دستوراتی مثل امار 365)
+                old = (_now_tehran() - timedelta(days=400)).strftime("%Y-%m-%d")
                 await asyncio.to_thread(_prune_sync, old)
         except Exception as e:
             logger.warning(f"[group_tools] background loop error: {e}")
