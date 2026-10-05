@@ -44,7 +44,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 import requests
+import premium_emoji as pe
 from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.filters.callback_data import CallbackData
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -500,16 +502,20 @@ async def flush_buffers() -> None:
             _buf_names.setdefault(k, v)
 
 
-def _build_stats_text(rows: List[Tuple[int, int, str, int]], days: int) -> str:
+def _build_stats_text(rows: List[Tuple[int, int, str, int]], days: int, premium: bool = True) -> str:
+    prem = pe.active(premium)
     now = _now_tehran()
     jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
     date_str = fa_digits(f"{jd:02d} {_FA_MONTHS[jm - 1]} {jy}")
     time_str = fa_digits(now.strftime("%H:%M:%S"))
 
-    title_day = "امروز" if days == 1 else f"{fa_digits(days)} روز گذشته"
+    # تعداد روز با ارقام طلایی؛ بدون پریمیوم: عدد فارسی ساده
+    title_day = "امروز" if days == 1 else f"{pe.digits(days, 'gold', prem, persian=True)} روز گذشته"
+    title = f"آمار کل فعالیت های {title_day}"
+    header = (f"{pe.e('flower_l')} <b>{title}</b> {pe.e('flower_r')}" if prem else f"➖ <b>{title}</b>")
 
     head = [
-        f"➖ <b>آمار کل فعالیت های {title_day}</b>",
+        header,
         "",
         f"• {_FA_WEEKDAYS[now.weekday()]}: {date_str}",
         f"• ساعت : {time_str}",
@@ -518,23 +524,53 @@ def _build_stats_text(rows: List[Tuple[int, int, str, int]], days: int) -> str:
         "",
     ]
     text = "\n".join(head)
+    entities = pe.entity_count(text)
     for i, (user_id, total, name, is_channel) in enumerate(rows, 1):
         safe = html.escape((name or "کاربر").strip()[:28])
         label = f"<b>{safe}</b>" if is_channel else f"<a href='tg://user?id={user_id}'>{safe}</a>"
-        line = f"\nنفر {i} {label} با {total} پیام"
-        if len(text) + len(line) > 3900:      # سقف ۴۰۹۶ کاراکتر تلگرام
+        # ۱۰ نفر اول با ارقام ایموجی: ۱ تا ۳ طلایی، ۴ تا ۱۰ نقره‌ای
+        rank = pe.digits(i, "gold" if i <= 3 else "silver", prem) if i <= 10 else str(i)
+        line = f"\nنفر {rank} {label} با {total} پیام"
+        line_entities = pe.entity_count(line)
+        if len(text) + len(line) > 3900 or entities + line_entities > 95:   # سقف ۴۰۹۶ کاراکتر و ۱۰۰ entity تلگرام
             break
         text += line
+        entities += line_entities
     return text
 
 
-async def build_stats_for_chat(chat_id: int, days: int = STATS_WINDOW_DAYS) -> Optional[str]:
+async def build_stats_for_chat(chat_id: int, days: int = STATS_WINDOW_DAYS, premium: bool = True) -> Optional[str]:
     await flush_buffers()
     since = (_now_tehran() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     rows = await asyncio.to_thread(_query_top_sync, chat_id, since, STATS_TOP_N)
     if not rows:
         return None
-    return _build_stats_text(rows, days)
+    return _build_stats_text(rows, days, premium)
+
+
+_no_premium_chats: Set[int] = set()   # چت‌هایی که ایموجی پریمیوم را نپذیرفته‌اند (تا ری‌استارت)
+
+
+async def _deliver_stats(send, chat_id: int, days: int) -> bool:
+    """
+    آمار را می‌سازد و می‌فرستد. اگر تلگرام ایموجی پریمیوم را نپذیرفت، همان آمار
+    با ایموجی معمولی دوباره ارسال می‌شود. send: تابعی که متن را می‌گیرد و می‌فرستد.
+    """
+    prem = pe.active() and chat_id not in _no_premium_chats
+    text = await build_stats_for_chat(chat_id, days, premium=prem)
+    if not text:
+        return False
+    try:
+        await send(text)
+    except TelegramBadRequest as e:
+        if not prem:
+            raise
+        logger.warning(f"[group_tools] ایموجی پریمیوم در {chat_id} پذیرفته نشد ({e}) → ارسال با ایموجی معمولی")
+        text = await build_stats_for_chat(chat_id, days, premium=False)
+        if text:
+            await send(text)
+            _no_premium_chats.add(chat_id)   # فقط وقتی نسخه‌ی معمولی رسید یعنی مشکل از ایموجی بوده
+    return True
 
 
 _admin_cache: Dict[Tuple[int, int], Tuple[float, bool]] = {}
@@ -581,9 +617,24 @@ async def handle_stats_command(message: types.Message):
             if match and match.group(1):
                 days = int(match.group(1))
 
-    text = await build_stats_for_chat(chat.id, days)
-    if text:
-        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await _deliver_stats(
+        lambda t: message.answer(t, parse_mode="HTML", disable_web_page_preview=True), chat.id, days)
+
+
+@group_router.message(Command("emojitest"))
+async def handle_emoji_test(message: types.Message):
+    """همه‌ی ایموجی‌های پریمیوم را نشان می‌دهد تا شناسه‌ها را چشمی تأیید کنید (در گروه فقط ادمین‌ها)."""
+    chat = message.chat
+    if chat.type in ("group", "supergroup"):
+        is_admin = (message.sender_chat is not None and message.sender_chat.id == chat.id) or (
+            message.from_user is not None and await _is_group_admin(message.bot, chat.id, message.from_user.id)
+        )
+        if not is_admin:
+            return
+    try:
+        await message.answer(pe.test_text(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        await message.answer(f"❌ تلگرام ایموجی پریمیوم را نپذیرفت:\n<code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 @group_router.message(Command("id"))
@@ -620,9 +671,9 @@ async def _maybe_auto_post(bot: Bot) -> None:
         if not _chat_allowed(chat_id):
             continue
         try:
-            text = await build_stats_for_chat(chat_id, STATS_WINDOW_DAYS)
-            if text:
-                await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+            await _deliver_stats(
+                lambda t, c=chat_id: bot.send_message(c, t, parse_mode="HTML", disable_web_page_preview=True),
+                chat_id, STATS_WINDOW_DAYS)
         except Exception as e:
             logger.warning(f"[group_tools] auto-post to {chat_id} failed: {e}")
 
@@ -752,21 +803,51 @@ async def _enforce_join(message: types.Message, user: types.User) -> None:
         return
     _warn_ts[key] = now
 
-    name = html.escape(user.full_name[:30])
-    text = (
-    f"جناب <a href='tg://user?id={user.id}'>{name}</a>، برای ارسال پیام در گروه "
-    f"باید ابتدا در کانال رسمی ما عضو شوید.\n\n"
-    f"بعد از عضویت روی دکمه «عضو شدم» بزنید."
-)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="عضویت در کانال 📢", url=FORCE_CHANNEL_URL),
-        InlineKeyboardButton(text="✅ عضو شدم", callback_data=JoinCheckCallback(user_id=user.id).pack()),
-    ]])
+    chat_id = message.chat.id
+    prem = pe.active() and chat_id not in _no_premium_chats
     try:
-        sent = await message.answer(text, parse_mode="HTML", reply_markup=kb)
-        _spawn(_delete_later(sent, WARN_DELETE_AFTER))
+        sent = await message.answer(**_warning_kwargs(user, prem))
+    except TelegramBadRequest as e:
+        if not prem:
+            logger.warning(f"[group_tools] warning send failed: {e}")
+            return
+        logger.warning(f"[group_tools] ایموجی پریمیوم در {chat_id} پذیرفته نشد ({e}) → ارسال با ایموجی معمولی")
+        try:
+            sent = await message.answer(**_warning_kwargs(user, False))
+        except Exception as e2:
+            logger.warning(f"[group_tools] warning send failed: {e2}")
+            return
+        _no_premium_chats.add(chat_id)
     except Exception as e:
         logger.warning(f"[group_tools] warning send failed: {e}")
+        return
+    _spawn(_delete_later(sent, WARN_DELETE_AFTER))
+
+
+def _warning_kwargs(user: types.User, premium: bool) -> dict:
+    """متن و دکمه‌های هشدار عضویت اجباری (premium=False: همان ظاهر ساده‌ی قبلی)."""
+    name = html.escape(user.full_name[:30])
+    body = (
+        f"جناب <a href='tg://user?id={user.id}'>{name}</a>، برای ارسال پیام در گروه "
+        f"باید ابتدا در کانال رسمی ما عضو شوید.\n\n"
+        f"بعد از عضویت روی دکمه «عضو شدم» بزنید."
+    )
+    callback = JoinCheckCallback(user_id=user.id).pack()
+    if premium:
+        text = f"{pe.e('flower_l')} <b>عضویت اجباری</b> {pe.e('flower_r')}\n\n{body}"
+        buttons = [
+            InlineKeyboardButton(text="عضویت در کانال", url=FORCE_CHANNEL_URL,
+                                 icon_custom_emoji_id=pe.icon_id("arrow_btn")),
+            InlineKeyboardButton(text="عضو شدم", callback_data=callback,
+                                 icon_custom_emoji_id=pe.icon_id("lock")),
+        ]
+    else:
+        text = body
+        buttons = [
+            InlineKeyboardButton(text="عضویت در کانال 📢", url=FORCE_CHANNEL_URL),
+            InlineKeyboardButton(text="✅ عضو شدم", callback_data=callback),
+        ]
+    return {"text": text, "parse_mode": "HTML", "reply_markup": InlineKeyboardMarkup(inline_keyboard=[buttons])}
 
 
 async def _passes_force_join(message: types.Message, user: types.User) -> bool:

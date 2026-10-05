@@ -52,6 +52,7 @@ from typing import Iterable, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
 import requests
+import premium_emoji as pe
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -461,42 +462,50 @@ def detect_symbols(title: str) -> List[str]:
     return found[:6]
 
 
-def format_message(listing: Listing, section: Section, html_mode: bool = True) -> str:
+def format_message(listing: Listing, section: Section, html_mode: bool = True, premium: bool = True) -> str:
     """
-    قالب ساده و تمیز، بدون خط و تزئین اضافه:
+    قالب پیام:
 
-        <تیتر بخش>
+        <گل> تیتر بخش <گل>
 
-        <عنوان خبر>
+        <زنگ> عنوان خبر
 
         تاریخ: ...
         دسته‌بندی: ...        (فقط لیستینگ‌ها)
         نماد: ...             (فقط لیستینگ‌ها)
 
-        مشاهده‌ی جزئیات
+        <فلش> مشاهده‌ی جزئیات
 
-        #هشتگ
+        <ایموجی هشتگ> نام هشتگ
+
+    premium=False (یا html_mode=False): همان ظاهر ساده با ایموجی معمولی و هشتگ واقعی.
     """
+    prem = pe.active(premium and html_mode)
     if html_mode:
         esc = html.escape
-        head = f"{section.emoji} <b>{section.title}</b>" if section.emoji else f"<b>{section.title}</b>"
-        link = f'<a href="{html.escape(listing.url, quote=True)}">مشاهده‌ی جزئیات</a>'
+        if section.emoji:
+            head = f"{section.emoji} <b>{section.title}</b>"
+        elif prem:
+            head = f"{pe.e('flower_l')} <b>{section.title}</b> {pe.e('flower_r')}"
+        else:
+            head = f"<b>{section.title}</b>"
+        link = f'{pe.e("arrow_link", prem)} <a href="{html.escape(listing.url, quote=True)}">مشاهده‌ی جزئیات</a>'
         sym_fmt = lambda x: f"<code>{html.escape(x)}</code>"
         date_fmt = lambda x: f"📅 <b>تاریخ:</b> {x}"
     else:  # متن ساده‌ی اضطراری: تگ‌های ایموجی حذف و فقط خود ایموجی می‌ماند
         esc = lambda x: x
         plain_emoji = re.sub(r"<[^>]+>", "", section.emoji)
         head = f"{plain_emoji} {section.title}".strip()
-        link = f"مشاهده‌ی جزئیات:\n{listing.url}"
+        link = f"{pe.PLAIN['arrow_link']} مشاهده‌ی جزئیات:\n{listing.url}"
         sym_fmt = lambda x: x
         date_fmt = lambda x: f"📅 تاریخ: {x}"
 
-    blocks = [head, f"\u200F{esc(listing.title)}"]
-    
+    blocks = [head, f"{pe.e('bell', prem)} \u200F{esc(listing.title)}"]
+
     details = []
     if listing.date_str:
         details.append(date_fmt(listing.date_str))
-        
+
     if section.detailed:
         category = detect_categories(listing.title)
         if category:
@@ -504,11 +513,11 @@ def format_message(listing: Listing, section: Section, html_mode: bool = True) -
         symbols = detect_symbols(listing.title)
         if symbols:
             details.append(f"\u200Fنماد: " + "، ".join(sym_fmt(x) for x in symbols))
-            
+
     if details:
         blocks.append("\n".join(details))
-        
-    blocks += [link, section.hashtag]
+
+    blocks += [link, pe.hashtag(section.hashtag, prem)]
     return "\n\n".join(blocks)
 
 
@@ -522,10 +531,12 @@ class TelegramSender:
         self.cfg = cfg
         self.url = f"https://api.telegram.org/bot{cfg.bot_token}/sendMessage"
         self.session = requests.Session()
+        self._no_premium: Set[str] = set()   # مقصدهایی که ایموجی پریمیوم را نپذیرفته‌اند (تا ری‌استارت دیگر امتحان نمی‌شود)
 
     def _safe(self, text: str) -> str:
         """توکن ربات هرگز در لاگ نیاید."""
-        return str(text).replace(self.cfg.bot_token, "***")
+        token = self.cfg.bot_token
+        return str(text).replace(token, "***") if token else str(text)
 
     def send(self, listing: Listing, section: Section) -> None:
         """به همه‌ی مقصدها می‌فرستد. فقط اگر به هیچ‌کدام نرسید خطا می‌دهد (تا خبر تکراری نشود)."""
@@ -542,9 +553,16 @@ class TelegramSender:
             raise last_error or TelegramError("هیچ مقصدی تنظیم نشده")
 
     def _send_to(self, listing: Listing, section: Section, chat_id: str, thread_id: Optional[int]) -> None:
+        # سه حالت به ترتیب: premium (ایموجی پریمیوم) → html (ایموجی معمولی) → plain (متن ساده)
+        mode = "premium" if (pe.ENABLED and chat_id not in self._no_premium) else "html"
+        downgraded = False
+
+        def build(m: str) -> str:
+            return format_message(listing, section, html_mode=(m != "plain"), premium=(m == "premium"))
+
         payload = {
             "chat_id": chat_id,
-            "text": format_message(listing, section, html_mode=True),
+            "text": build(mode),
             "parse_mode": "HTML",
             "disable_web_page_preview": not self.cfg.preview,
         }
@@ -561,6 +579,8 @@ class TelegramSender:
                 continue
 
             if resp.status_code == 200:
+                if downgraded and mode != "premium":
+                    self._no_premium.add(chat_id)   # فقط وقتی نسخه‌ی معمولی رسید یعنی مشکل از ایموجی بوده
                 return
 
             try:
@@ -574,10 +594,17 @@ class TelegramSender:
                 logger.warning(f"Flood control؛ {wait} ثانیه صبر")
                 STOP_EVENT.wait(min(wait, 60))
                 continue
+            if resp.status_code == 400 and mode == "premium":
+                logger.warning(f"ایموجی پریمیوم برای {chat_id} پذیرفته نشد ({self._safe(desc)}) → ارسال با ایموجی معمولی")
+                downgraded = True
+                mode = "html"
+                payload["text"] = build(mode)
+                continue
             if resp.status_code == 400 and "parse entities" in desc.lower() and "parse_mode" in payload:
                 logger.warning("خطای HTML؛ ارسال مجدد به‌صورت متن ساده")
                 payload.pop("parse_mode")
-                payload["text"] = format_message(listing, section, html_mode=False)
+                mode = "plain"
+                payload["text"] = build(mode)
                 continue
             if resp.status_code >= 500:
                 STOP_EVENT.wait(2 ** attempt)
@@ -680,10 +707,28 @@ def _dry_run(cfg: Config) -> None:
         print(format_message(max(listings, key=lambda l: l.article_id), section, html_mode=False))
 
 
+def _test_send(cfg: Config) -> None:
+    """برای هر بخش یک پیام نمونه به مقصدها می‌فرستد تا ظاهر (و ایموجی‌های پریمیوم) را ببینید."""
+    sender = TelegramSender(cfg)
+    samples = {
+        "listings": "SuperEx معاملات اسپات TEST (TST) را لیست می‌کند",
+        "announcements": "این یک اطلاعیه‌ی آزمایشی است",
+        "events": "این یک رویداد آزمایشی است",
+        "updates": "این یک اطلاعیه‌ی آزمایشی نگهداری است",
+    }
+    for i, section in enumerate(cfg.sections, 1):
+        sample = Listing(0 - i, samples.get(section.key, "پیام آزمایشی"),
+                         "https://support.superex.com/hc/fa", date_str="۱۴ مهر ۱۴۰۵")
+        sender.send(sample, section)
+        print(f"ارسال شد: {section.key}")
+        STOP_EVENT.wait(1.5)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="مانیتور لیست‌های جدید SuperEx")
     parser.add_argument("--once", action="store_true", help="فقط یک بار چک کن")
     parser.add_argument("--dry-run", action="store_true", help="فقط بخوان و پیش‌نمایش بده")
+    parser.add_argument("--test-send", action="store_true", help="برای هر بخش یک پیام نمونه به مقصدها بفرست (بدون دست زدن به دیتابیس)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -694,6 +739,9 @@ def main() -> None:
         return
 
     cfg.validate()
+    if args.test_send:
+        _test_send(cfg)
+        return
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: STOP_EVENT.set())
 
