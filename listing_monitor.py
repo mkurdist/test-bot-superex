@@ -409,13 +409,13 @@ def format_message(listing: Listing, section: Section, html_mode: bool = True, p
         esc = html.escape
         head = f"{section.emoji} <b>{section.title}</b>" if section.emoji else (f"{pe.e('flower_l')} <b>{section.title}</b> {pe.e('flower_r')}" if prem else f"<b>{section.title}</b>")
         link = f'{pe.e("arrow_link", prem)} <a href="{html.escape(listing.url, quote=True)}">مشاهده‌ی جزئیات</a>'
-        sym_fmt, date_fmt = lambda x: f"<code>{html.escape(x)}</code>", lambda x: f"📅 <b>تاریخ:</b> {x}"
+        sym_fmt, date_fmt = lambda x: f"<code>{html.escape(x)}</code>", lambda x: f"{pe.e('date', prem)} <b>تاریخ:</b> {x}"
     else:
         esc = lambda x: x
         plain_emoji = re.sub(r"<[^>]+>", "", section.emoji)
         head = f"{plain_emoji} {section.title}".strip()
         link = f"{pe.PLAIN['arrow_link']} مشاهده‌ی جزئیات:\n{listing.url}"
-        sym_fmt, date_fmt = lambda x: x, lambda x: f"📅 تاریخ: {x}"
+        sym_fmt, date_fmt = lambda x: x, lambda x: f"{pe.PLAIN['date']} تاریخ: {x}"
 
     blocks = [head, f"{pe.e('bell', prem)} \u200F{esc(listing.title)}"]
     details = []
