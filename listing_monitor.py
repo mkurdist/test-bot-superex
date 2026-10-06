@@ -305,7 +305,7 @@ class SupabaseStorage(Storage):
                 if resp.status >= 300:
                     text = await resp.text()
                     raise StorageError(f"Supabase HTTP {resp.status}: {text[:200]}")
-                return await resp.json() if resp.status != 204 else None
+                return await resp.json() if resp.status not in (201, 204) else None
         except aiohttp.ClientError as e:
             raise StorageError(f"Cysylltiad â Supabase wedi methu: {e}")
     async def is_section_empty(self, section_key: str) -> bool:
