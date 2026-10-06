@@ -511,7 +511,7 @@ def _build_stats_text(rows: List[Tuple[int, int, str, int]], days: int, premium:
 
     # تعداد روز با ارقام طلایی؛ بدون پریمیوم: عدد فارسی ساده
     title_day = "امروز" if days == 1 else f"{pe.digits(days, 'gold', prem, persian=True)} روز گذشته"
-    title = f"آمار کل فعالیت های {title_day}"
+    title = f" فعالیت  {title_day}"
     header = (f"{pe.e('flower_l')} <b>{title}</b> {pe.e('flower_r')}" if prem else f"➖ <b>{title}</b>")
 
     head = [
@@ -521,22 +521,26 @@ def _build_stats_text(rows: List[Tuple[int, int, str, int]], days: int, premium:
         f"• ساعت : {time_str}",
         "",
         "• فعال ترین اعضا به ترتیب:",
-        "",
     ]
-    text = "\n".join(head)
+    text = "\n".join(head) + "\n"
     entities = pe.entity_count(text)
+    
     for i, (user_id, total, name, is_channel) in enumerate(rows, 1):
         safe = html.escape((name or "کاربر").strip()[:28])
         label = f"<b>{safe}</b>" if is_channel else f"<a href='tg://user?id={user_id}'>{safe}</a>"
-        # ۱۰ نفر اول با ارقام ایموجی: ۱ تا ۳ طلایی، ۴ تا ۱۰ نقره‌ای
+        
         rank = pe.digits(i, "gold" if i <= 3 else "silver", prem) if i <= 10 else str(i)
-        line = f"\nنفر {rank} {label} با {total} پیام"
+        
+        # تغییر ۲: اضافه کردن فاصله (\n) اضافه برای فاصله‌گذاری بین اعضا
+        line = f"\nنفر {rank} {label} با {total} پیام\n"
+        
         line_entities = pe.entity_count(line)
         if len(text) + len(line) > 3900 or entities + line_entities > 95:   # سقف ۴۰۹۶ کاراکتر و ۱۰۰ entity تلگرام
             break
         text += line
         entities += line_entities
-    return text
+        
+    return text.strip()
 
 
 async def build_stats_for_chat(chat_id: int, days: int = STATS_WINDOW_DAYS, premium: bool = True) -> Optional[str]:
