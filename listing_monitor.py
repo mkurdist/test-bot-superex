@@ -3,22 +3,16 @@
 listing_monitor.py
 ---------------------------------------------------------
 مانیتور مرکز اطلاعیه‌های SuperEx (نسخه‌ی فارسی) و ارسال خبرها به تلگرام.
-نسخه کاملا ناهمگام (Async/aiohttp) با سیستم تضمین ضد-تکرار پیشرفته (State Machine).
+نسخه نهایی ناهمگام (Async) با تفکیک کامل ۴ جدول، سیستم صفحه‌بندی (Pagination) 
+و وضعیت‌سنجی ضد-تکرار (State Machine).
 
-چهار بخش پایش می‌شود: لیست‌های جدید، اطلاعیه‌ها، رویدادها، به‌روزرسانی/نگهداری/حذف.
-
-جریان کار پیشرفته:
-    ۱) بخش‌ها به صورت ناهمگام واکشی می‌شوند (سریع‌تر و بدون بلاک منابع).
-    ۲) شناسه‌ی مقاله‌ها در دیتابیس چک می‌شود. دیتابیس حالا بر اساس بخش تفکیک شده است.
-    ۳) به محض یافتن خبر جدید:
-       - ابتدا رکورد با وضعیت `pending` در دیتابیس ثبت می‌شود.
-       - ربات پیام را به تلگرام می‌فرستد.
-       - پس از تایید ارسال از تلگرام، وضعیت در دیتابیس به `sent` تغییر می‌کند.
-       (این مکانیزم از ارسال تکراری در زمان قطعی موقت سرور جلوگیری می‌کند).
-    ۴) تاریخ انتشار در سایت (published_date) جایگزین تاریخ زمانِ ربات شده است.
-
-اجرا:
-    مانند نسخه قبل، تابع start_in_background همچنان برای فراخوانی در main.py معتبر است.
+ویژگی‌های این نسخه:
+    ۱) استفاده از ۴ جدول مجزا (seen_listings, seen_announcements, seen_events, seen_updates).
+    ۲) دریافت تمام تاریخچه (ورق زدن اتوماتیک صفحات Zendesk تا اولین خبر).
+    ۳) ثبت تاریخ واقعی انتشار (published_date) از سایت.
+    ۴) ثبت خبر به صورت pending پیش از ارسال، و sent پس از اطمینان از ارسال.
+    ۵) رفع قطعی باگ‌های Supabase (هدر User-Agent و ارور JSON خالی).
+    ۶) سازگاری کامل با main.py بدون تداخل در Event Loop ها.
 ---------------------------------------------------------
 """
 
@@ -105,7 +99,6 @@ class Config:
     preview: bool
     supabase_url: str
     supabase_key: str
-    supabase_table: str
     sqlite_path: str
 
     @classmethod
@@ -130,7 +123,6 @@ class Config:
             preview=os.getenv("LISTING_PREVIEW", "0").strip() == "1",
             supabase_url=os.getenv("SUPABASE_URL", "").strip().rstrip("/"),
             supabase_key=os.getenv("SUPABASE_KEY", "").strip(),
-            supabase_table=os.getenv("SUPABASE_TABLE", "seen_listings").strip(),
             sqlite_path=os.getenv("LISTING_SQLITE_PATH", "listing_seen.sqlite3").strip(),
         )
 
@@ -146,7 +138,7 @@ class Listing:
     article_id: int
     title: str
     url: str
-    section_key: str  # برای تفکیک در دیتابیس
+    section_key: str  
     date_str: str = "" 
 
 
@@ -185,7 +177,7 @@ def parse_and_format_date(date_str: str) -> str:
 
 
 # ===========================================================
-# بخش ۱: دریافت و پارس کردن خبرها (کاملا Async)
+# بخش ۱: دریافت و پارس کردن خبرها (با پشتیبانی از صفحه‌بندی کامل)
 # ===========================================================
 _ARTICLE_ID_RE = re.compile(r"/articles/(\d+)")
 
@@ -215,15 +207,16 @@ def parse_listings_html(html_content: str, section: Section) -> List[Listing]:
         clean_url = full.split("#")[0].split("?")[0]
         listings.append(Listing(article_id, title, clean_url, section.key, date_str))
 
-    if not listings: raise ParseError("هیچ مقاله‌ای در صفحه پیدا نشد")
+    if not listings: raise ParseError("هیچ مقاله‌ای در صفحه HTML پیدا نشد")
     return listings
 
 def _zendesk_api_url(source_url: str) -> Optional[str]:
     m = re.search(r"/hc/([^/]+)/sections/(\d+)", source_url)
     if not m: return None
     parsed = urlparse(source_url)
+    # دریافت ۱۰۰ رکورد در هر صفحه برای تسریع فرایند کشیدن تاریخچه کامل
     return (f"{parsed.scheme}://{parsed.netloc}/api/v2/help_center/{m.group(1)}/sections/{m.group(2)}"
-            f"/articles.json?sort_by=created_at&sort_order=desc&per_page=30")
+            f"/articles.json?sort_by=created_at&sort_order=desc&per_page=100")
 
 async def _fetch_with_retry(session: aiohttp.ClientSession, url: str, is_json=True):
     for attempt in range(1, 4):
@@ -243,16 +236,24 @@ async def _fetch_via_api(session: aiohttp.ClientSession, section: Section) -> Li
     api_url = _zendesk_api_url(section.url)
     if not api_url: raise FetchError("آدرس API قابل ساخت نیست")
     
-    data = await _fetch_with_retry(session, api_url, is_json=True)
-    articles = data.get("articles", [])
-    
     listings = []
-    for a in articles:
-        if a.get("id") and a.get("title") and a.get("html_url"):
-            dt = parse_and_format_date(str(a.get("created_at", "")))
-            listings.append(Listing(
-                int(a["id"]), str(a["title"]).strip(), str(a["html_url"]).split("?")[0], section.key, dt
-            ))
+    next_url = api_url
+    
+    # حلقه دریافت تمامی صفحات تاریخچه (Pagination)
+    while next_url:
+        data = await _fetch_with_retry(session, next_url, is_json=True)
+        articles = data.get("articles", [])
+        
+        for a in articles:
+            if a.get("id") and a.get("title") and a.get("html_url"):
+                dt = parse_and_format_date(str(a.get("created_at", "")))
+                listings.append(Listing(
+                    int(a["id"]), str(a["title"]).strip(), str(a["html_url"]).split("?")[0], section.key, dt
+                ))
+        
+        next_url = data.get("next_page")
+        if next_url:
+            await asyncio.sleep(0.5)  # وقفه کوتاه برای جلوگیری از فشار به سرور Zendesk
             
     if not listings: raise ParseError("API مقاله‌ای برنگرداند")
     return listings
@@ -273,22 +274,22 @@ async def fetch_listings(session: aiohttp.ClientSession, section: Section) -> Li
 
 
 # ===========================================================
-# بخش ۲: ذخیره‌سازی «دیده‌شده‌ها» (وضعیت‌دار و تفکیک‌شده)
+# بخش ۲: ذخیره‌سازی ۴ جدولی
 # ===========================================================
 class Storage(ABC):
     @abstractmethod
     async def is_section_empty(self, section_key: str) -> bool: ...
     @abstractmethod
-    async def get_status(self, ids: Iterable[int]) -> Dict[int, str]: ...
+    async def get_status(self, section_key: str, ids: Iterable[int]) -> Dict[int, str]: ...
     @abstractmethod
-    async def upsert_status(self, listings: Iterable[Listing], status: str) -> None: ...
+    async def upsert_status(self, section_key: str, listings: Iterable[Listing], status: str) -> None: ...
 
 
 class SupabaseStorage(Storage):
-    def __init__(self, session: aiohttp.ClientSession, url: str, key: str, table: str):
-        self.base = f"{url}/rest/v1/{table}"
+    def __init__(self, session: aiohttp.ClientSession, url: str, key: str):
+        self.url = url
         self.session = session
-        # Ychwanegu User-Agent arferol i osgoi gwall 401 Supabase
+        # User-Agent غیر مرورگر برای دور زدن محدودیت‌های امنیتی Supabase
         self.headers = {
             "apikey": key, 
             "Content-Type": "application/json",
@@ -297,31 +298,50 @@ class SupabaseStorage(Storage):
         if key.startswith("eyJ"):
             self.headers["Authorization"] = f"Bearer {key}"
 
-    async def _request(self, method: str, params=None, json=None, prefer=None):
+    async def _request(self, table_name: str, method: str, params=None, json=None, prefer=None):
+        base_url = f"{self.url}/rest/v1/{table_name}"
         headers = dict(self.headers)
         if prefer: headers["Prefer"] = prefer
         try:
-            async with self.session.request(method, self.base, params=params, json=json, headers=headers, timeout=HTTP_TIMEOUT) as resp:
+            async with self.session.request(method, base_url, params=params, json=json, headers=headers, timeout=HTTP_TIMEOUT) as resp:
                 if resp.status >= 300:
                     text = await resp.text()
-                    raise StorageError(f"Supabase HTTP {resp.status}: {text[:200]}")
-                return await resp.json() if resp.status not in (201, 204) else None
-        except aiohttp.ClientError as e:
-            raise StorageError(f"Cysylltiad â Supabase wedi methu: {e}")
-    async def is_section_empty(self, section_key: str) -> bool:
-        data = await self._request("GET", params={"select": "article_id", "section_name": f"eq.{section_key}", "limit": "1"})
-        return len(data) == 0
+                    raise StorageError(f"Supabase HTTP {resp.status} on {table_name}: {text[:200]}")
+                
+                # رفع باگ بادی خالی (Supabase 204 No Content یا کد 200 خالی)
+                if resp.status == 204:
+                    return None
+                    
+                text = await resp.text()
+                if not text.strip():
+                    return None
+                    
+                return await resp.json()
+        except Exception as e:
+            raise StorageError(f"خطای ارتباط با Supabase ({table_name}): {e}")
 
-    async def get_status(self, ids: Iterable[int]) -> Dict[int, str]:
+    async def is_section_empty(self, section_key: str) -> bool:
+        table_name = f"seen_{section_key}"
+        data = await self._request(table_name, "GET", params={"select": "article_id", "limit": "1"})
+        return not data or len(data) == 0
+
+    async def get_status(self, section_key: str, ids: Iterable[int]) -> Dict[int, str]:
+        table_name = f"seen_{section_key}"
         id_list = ",".join(str(i) for i in ids)
         if not id_list: return {}
-        data = await self._request("GET", params={"select": "article_id,status", "article_id": f"in.({id_list})"})
+        data = await self._request(table_name, "GET", params={"select": "article_id,status", "article_id": f"in.({id_list})"})
+        if not data: return {}
         return {int(r["article_id"]): r.get("status", "sent") for r in data}
 
-    async def upsert_status(self, listings: Iterable[Listing], status: str) -> None:
-        rows = [{"article_id": l.article_id, "title": l.title, "url": l.url, "section_name": l.section_key, "published_date": l.date_str, "status": status} for l in listings]
+    async def upsert_status(self, section_key: str, listings: Iterable[Listing], status: str) -> None:
+        table_name = f"seen_{section_key}"
+        # ارسال ردیف‌ها به صورت دسته‌های ۱۰۰ تایی برای جلوگیری از فشار به API در زمان ساخت خط پایه (مهم برای صدها رکورد)
+        rows = [{"article_id": l.article_id, "title": l.title, "url": l.url, "published_date": l.date_str, "status": status} for l in listings]
         if not rows: return
-        await self._request("POST", params={"on_conflict": "article_id"}, json=rows, prefer="resolution=merge-duplicates,return=minimal")
+        
+        for i in range(0, len(rows), 100):
+            batch = rows[i:i + 100]
+            await self._request(table_name, "POST", params={"on_conflict": "article_id"}, json=batch, prefer="resolution=merge-duplicates,return=minimal")
 
 
 class SqliteStorage(Storage):
@@ -329,44 +349,39 @@ class SqliteStorage(Storage):
         self.lock = threading.Lock()
         try:
             self.conn = sqlite3.connect(path, check_same_thread=False)
-            self.conn.execute("CREATE TABLE IF NOT EXISTS seen (article_id INTEGER PRIMARY KEY, title TEXT, url TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            # ارتقای خودکار ساختار دیتابیس لوکال برای رکوردهای قدیمی
-            try: self.conn.execute("ALTER TABLE seen ADD COLUMN section_name TEXT DEFAULT 'unknown'")
-            except sqlite3.OperationalError: pass
-            try: self.conn.execute("ALTER TABLE seen ADD COLUMN published_date TEXT")
-            except sqlite3.OperationalError: pass
-            try: self.conn.execute("ALTER TABLE seen ADD COLUMN status TEXT DEFAULT 'sent'")
-            except sqlite3.OperationalError: pass
+            for sec in ("listings", "announcements", "events", "updates"):
+                self.conn.execute(f"CREATE TABLE IF NOT EXISTS seen_{sec} (article_id INTEGER PRIMARY KEY, title TEXT, url TEXT, published_date TEXT, status TEXT DEFAULT 'sent', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
             self.conn.commit()
         except sqlite3.Error as e:
             raise StorageError(f"باز کردن SQLite ناموفق: {e}")
 
     async def is_section_empty(self, section_key: str) -> bool:
         def _check():
-            with self.lock: return self.conn.execute("SELECT 1 FROM seen WHERE section_name = ? LIMIT 1", (section_key,)).fetchone() is None
+            with self.lock: return self.conn.execute(f"SELECT 1 FROM seen_{section_key} LIMIT 1").fetchone() is None
         return await asyncio.to_thread(_check)
 
-    async def get_status(self, ids: Iterable[int]) -> Dict[int, str]:
+    async def get_status(self, section_key: str, ids: Iterable[int]) -> Dict[int, str]:
         def _get():
             id_list = list(ids)
             if not id_list: return {}
             marks = ",".join("?" * len(id_list))
-            with self.lock: return {r[0]: r[1] for r in self.conn.execute(f"SELECT article_id, status FROM seen WHERE article_id IN ({marks})", id_list).fetchall()}
+            with self.lock: return {r[0]: r[1] for r in self.conn.execute(f"SELECT article_id, status FROM seen_{section_key} WHERE article_id IN ({marks})", id_list).fetchall()}
         return await asyncio.to_thread(_get)
 
-    async def upsert_status(self, listings: Iterable[Listing], status: str) -> None:
+    async def upsert_status(self, section_key: str, listings: Iterable[Listing], status: str) -> None:
         def _upsert():
             with self.lock:
                 self.conn.executemany(
-                    "INSERT INTO seen (article_id, title, url, section_name, published_date, status) VALUES (?,?,?,?,?,?) "
+                    f"INSERT INTO seen_{section_key} (article_id, title, url, published_date, status) VALUES (?,?,?,?,?) "
                     "ON CONFLICT(article_id) DO UPDATE SET status = excluded.status",
-                    [(l.article_id, l.title, l.url, l.section_key, l.date_str, status) for l in listings])
+                    [(l.article_id, l.title, l.url, l.date_str, status) for l in listings])
                 self.conn.commit()
         await asyncio.to_thread(_upsert)
 
+
 def build_storage(cfg: Config, session: aiohttp.ClientSession) -> Storage:
     if cfg.supabase_url and cfg.supabase_key:
-        return SupabaseStorage(session, cfg.supabase_url, cfg.supabase_key, cfg.supabase_table)
+        return SupabaseStorage(session, cfg.supabase_url, cfg.supabase_key)
     logger.warning("SUPABASE تنظیم نشده؛ از SQLite محلی استفاده می‌شود")
     return SqliteStorage(cfg.sqlite_path)
 
@@ -418,7 +433,7 @@ def format_message(listing: Listing, section: Section, html_mode: bool = True, p
 
 
 # ===========================================================
-# بخش ۴: ارسال به تلگرام (کاملا Async)
+# بخش ۴: ارسال به تلگرام
 # ===========================================================
 class TelegramSender:
     MAX_ATTEMPTS = 4
@@ -478,22 +493,22 @@ class TelegramSender:
                         await asyncio.sleep(2 ** attempt)
                         continue
                     raise TelegramError(f"HTTP {resp.status}: {self._safe(desc)}")
-            except aiohttp.ClientError as e:
+            except aiohttp.ClientError:
                 await asyncio.sleep(2 ** attempt)
         raise TelegramError("ارسال بعد از چند تلاش ناموفق ماند")
 
 
 # ===========================================================
-# بخش ۵: حلقه‌ی اصلی Async
+# بخش ۵: حلقه‌ی اصلی
 # ===========================================================
 async def _process_section(section: Section, cfg: Config, http: aiohttp.ClientSession, storage: Storage, sender: TelegramSender) -> int:
     listings = await fetch_listings(http, section)
-    statuses = await storage.get_status([l.article_id for l in listings])
+    statuses = await storage.get_status(section.key, [l.article_id for l in listings])
 
-    # ثبت خط پایه اختصاصیِ همین بخش
+    # ثبت خط پایه (دریافت و ذخیره در سکوت کل تاریخچه سایت)
     if await storage.is_section_empty(section.key):
-        await storage.upsert_status(listings, "sent")
-        logger.info(f"[{section.key}] خط پایه ثبت شد ({len(listings)} خبر؛ چیزی ارسال نشد)")
+        await storage.upsert_status(section.key, listings, "sent")
+        logger.info(f"[{section.key}] خط پایه ثبت شد ({len(listings)} خبر تاریخی ذخیره شد؛ چیزی ارسال نشد)")
         return 0
 
     new_listings = sorted([l for l in listings if statuses.get(l.article_id) != "sent"], key=lambda x: x.article_id)
@@ -501,24 +516,24 @@ async def _process_section(section: Section, cfg: Config, http: aiohttp.ClientSe
 
     if len(new_listings) > cfg.max_per_cycle:
         skipped, new_listings = new_listings[:-cfg.max_per_cycle], new_listings[-cfg.max_per_cycle:]
-        await storage.upsert_status(skipped, "sent")
+        await storage.upsert_status(section.key, skipped, "sent")
 
     sent = 0
     for listing in new_listings:
         if STOP_FLAG: break
         
-        # 1. وضعیت Pending برای جلوگیری از ارسال تکراری در صورت کرش
-        await storage.upsert_status([listing], "pending")
+        # ۱. وضعیت Pending
+        await storage.upsert_status(section.key, [listing], "pending")
         
-        # 2. تلاش برای ارسال
+        # ۲. تلاش برای ارسال
         try:
             await sender.send(listing, section)
         except TelegramError as e:
             logger.error(f"[{section.key}] ارسال «{listing.title[:60]}» ناموفق: {e} — دوره‌ی بعد دوباره تلاش می‌شود")
             break
             
-        # 3. تایید قطعی و ثبت نهایی (Sent)
-        await storage.upsert_status([listing], "sent")
+        # ۳. ثبت موفقیت‌آمیز Sent
+        await storage.upsert_status(section.key, [listing], "sent")
         sent += 1
         await asyncio.sleep(1.5)
         
@@ -536,6 +551,10 @@ async def run_once_async(cfg: Config) -> int:
                 total += await _process_section(section, cfg, http, storage, sender)
             except (FetchError, ParseError) as e:
                 logger.warning(f"[{section.key}] دریافت خبرها ناموفق: {e}")
+            except StorageError as e:
+                logger.error(f"[{section.key}] خطای دیتابیس در این بخش: {e}")
+            except Exception as e:
+                logger.error(f"[{section.key}] خطای غیرمنتظره: {e}")
     return total
 
 
@@ -546,19 +565,15 @@ async def run_forever_async(cfg: Config):
     while not STOP_FLAG:
         try:
             await run_once_async(cfg)
-        except StorageError as e:
-            logger.error(f"دیتابیس در دسترس نیست؛ این دوره رد شد: {e}")
         except Exception:
-            logger.exception("خطای پیش‌بینی‌نشده؛ حلقه ادامه پیدا می‌کند")
+            logger.exception("خطای پیش‌بینی‌نشده در حلقه اصلی؛ مانیتورینگ متوقف نمی‌شود.")
             
-        # استراحت بدون مسدود کردن ترد
         for _ in range(cfg.interval):
             if STOP_FLAG: break
             await asyncio.sleep(1)
 
 
 def _bg_runner(cfg: Optional[Config] = None):
-    """هسته اجرای مجزا برای سازگاری کامل با main.py بدون تغییر در کدهای بیرونی"""
     cfg = cfg or Config.from_env()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -569,7 +584,7 @@ def _bg_runner(cfg: Optional[Config] = None):
 
 
 def start_in_background() -> threading.Thread:
-    """این تابع دقیقا همانند نسخه قبلی صدا زده می‌شود و نیازی به تغییر main.py ندارد."""
+    """اجرا به صورت پس‌زمینه بدون تداخل با Event Loop برنامه‌ی اصلی main.py"""
     thread = threading.Thread(target=_bg_runner, name="listing-monitor", daemon=True)
     thread.start()
     return thread
@@ -600,26 +615,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ===========================================================
-# آپدیت SQL لازم برای Supabase (در SQL Editor سوپابیس اجرا کنید)
-# ===========================================================
-"""
--- اگر جدول از قبل وجود دارد، سه ستون جدید را به آن اضافه کنید:
-ALTER TABLE public.seen_listings ADD COLUMN IF NOT EXISTS section_name text DEFAULT 'unknown';
-ALTER TABLE public.seen_listings ADD COLUMN IF NOT EXISTS published_date text;
-ALTER TABLE public.seen_listings ADD COLUMN IF NOT EXISTS status text DEFAULT 'sent';
-
--- اگر جدول را از صفر می‌سازید، این ساختار کامل است:
-create table if not exists public.seen_listings (
-    article_id bigint primary key,
-    title      text        not null,
-    url        text        not null,
-    section_name text      not null default 'unknown',
-    published_date text,
-    status     text        not null default 'sent',
-    created_at timestamptz not null default now()
-);
-alter table public.seen_listings enable row level security;
-"""
