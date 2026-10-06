@@ -13,6 +13,7 @@ premium_emoji.py
 ---------------------------------------------------------
 """
 import os
+import re
 
 ENABLED = os.getenv("PREMIUM_EMOJI", "1").strip() not in ("0", "false", "False", "")
 
@@ -90,5 +91,25 @@ def hashtag(tag_text: str, premium: bool = True) -> str:
     return f"{e('hash')} {tag_text.lstrip('#').replace('_', ' ')}"
 
 
+_ENTITY_OPEN_RE = re.compile(
+    r"<(?:tg-emoji|b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler|blockquote)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
 def entity_count(html_text: str) -> int:
-    """تعداد تقریبی entity های پیام (سقف تلگرام ۱۰۰ تا است)."""
+    """تعداد entity های پیام (سقف تلگرام ۱۰۰ تا است): هر تگ باز شده‌ی HTML یک entity حساب می‌شود."""
+    if not html_text:
+        return 0
+    return len(_ENTITY_OPEN_RE.findall(html_text))
+
+
+def test_text() -> str:
+    """متن آزمایشی برای دستور /emojitest: همه‌ی ایموجی‌ها و ارقام را نشان می‌دهد."""
+    lines = ["<b>تست ایموجی‌های پریمیوم</b>", ""]
+    for name in IDS:
+        lines.append(f"{name}: {e(name)}")
+    lines.append("")
+    lines.append("طلایی: " + digits("0123456789", "gold"))
+    lines.append("نقره‌ای: " + digits("0123456789", "silver"))
+    return "\n".join(lines)
