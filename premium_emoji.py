@@ -93,10 +93,8 @@ def digits(value, style: str = "gold", premium: bool = True, persian: bool = Fal
 
 
 def hashtag(tag_text: str, premium: bool = True) -> str:
-    """«#لیست_جدید» → «<ایموجی> لیست جدید» (غیرپریمیوم: همان هشتگ واقعی و قابل‌کلیک)."""
-    if not active(premium):
-        return tag_text
-    return f"{e('hash')} {tag_text.lstrip('#').replace('_', ' ')}"
+    """هشتگ واقعی، متنی و قابل‌کلیک (بدون ایموجی پریمیوم)."""
+    return tag_text
 
 
 _ENTITY_OPEN_RE = re.compile(
