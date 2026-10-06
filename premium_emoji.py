@@ -54,6 +54,7 @@ PLAIN = {"flower_l": "", "flower_r": "", "arrow_link": "🔗", "arrow_btn": "�
          "lock": "✅", "bell": "🔔", "hash": "#", "date": "📅"}
 
 _FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+_LRM = "‎"  # Left-to-Right Mark (نامرئی)
 
 
 def active(premium: bool = True) -> bool:
@@ -81,7 +82,10 @@ def digits(value, style: str = "gold", premium: bool = True, persian: bool = Fal
     if not active(premium):
         return text.translate(_FA) if persian else text
     table = GOLD if style == "gold" else SILVER
-    return "".join(_tag(table[c], _KEYCAP[c]) if c in table else c for c in text)
+    parts = [_tag(table[c], _KEYCAP[c]) if c in table else c for c in text]
+    # داخل متن راست‌به‌چپ، ایموجی‌های پشت‌سرهم معکوس نمایش داده می‌شوند (۳۴۴ ← ۴۴۳).
+    # علامت نامرئی LRM بین و دور ارقام، آن‌ها را یک بلوک چپ‌به‌راست می‌کند.
+    return _LRM + _LRM.join(parts) + _LRM
 
 
 def hashtag(tag_text: str, premium: bool = True) -> str:
