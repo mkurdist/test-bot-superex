@@ -55,7 +55,7 @@ ALL_SECTIONS = (
     Section("listings", "لیست جدید", "#لیست_جدید", _BASE + "9117167570457", detailed=True),
     Section("announcements", "اطلاعیه", "#اطلاعیه", _BASE + "9117102988825"),
     Section("events", "رویداد", "#رویداد", _BASE + "9117136933657"),
-    Section("updates", "به‌روزرسانی و نگهداری", "#به_روزرسانی", _BASE + "9117198982041"),
+    Section("updates", "به‌روزرسانی و نگهداری", "#آپدیت", _BASE + "9117198982041"),
 )
 
 BROWSER_HEADERS = {
