@@ -288,7 +288,12 @@ class SupabaseStorage(Storage):
     def __init__(self, session: aiohttp.ClientSession, url: str, key: str, table: str):
         self.base = f"{url}/rest/v1/{table}"
         self.session = session
-        self.headers = {"apikey": key, "Content-Type": "application/json"}
+        # Ychwanegu User-Agent arferol i osgoi gwall 401 Supabase
+        self.headers = {
+            "apikey": key, 
+            "Content-Type": "application/json",
+            "User-Agent": "SuperExBot/1.0"
+        }
         if key.startswith("eyJ"):
             self.headers["Authorization"] = f"Bearer {key}"
 
@@ -302,8 +307,7 @@ class SupabaseStorage(Storage):
                     raise StorageError(f"Supabase HTTP {resp.status}: {text[:200]}")
                 return await resp.json() if resp.status != 204 else None
         except aiohttp.ClientError as e:
-            raise StorageError(f"اتصال به Supabase ناموفق: {e}")
-
+            raise StorageError(f"Cysylltiad â Supabase wedi methu: {e}")
     async def is_section_empty(self, section_key: str) -> bool:
         data = await self._request("GET", params={"select": "article_id", "section_name": f"eq.{section_key}", "limit": "1"})
         return len(data) == 0
