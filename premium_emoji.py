@@ -55,10 +55,6 @@ PLAIN = {"flower_l": "", "flower_r": "", "arrow_link": "🔗", "arrow_btn": "�
 
 _FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
-# کاراکترهای ایزوله‌کننده‌ی جهت (نامرئی)
-_LRE = "\u202A"  # Left-to-Right Embedding (شروع بلوک چپ‌به‌راست)
-_PDF = "\u202C"  # Pop Directional Formatting (پایان بلوک و بازگشت به حالت راست‌به‌چپ جمله)
-
 
 def active(premium: bool = True) -> bool:
     """آیا در این پیام باید ایموجی پریمیوم استفاده شود؟"""
@@ -84,12 +80,15 @@ def digits(value, style: str = "gold", premium: bool = True, persian: bool = Fal
     text = str(value)
     if not active(premium):
         return text.translate(_FA) if persian else text
+    
     table = GOLD if style == "gold" else SILVER
     parts = [_tag(table[c], _KEYCAP[c]) if c in table else c for c in text]
     
-    # با استفاده از کاراکترهای LRE و PDF، کل ارقام را در یک "جزیره" چپ‌به‌راست قرار می‌دهیم.
-    # این کار از معکوس شدن اعداد (۳۴۴ ← ۴۴۳) جلوگیری می‌کند، بدون اینکه چیدمان بقیه خط به هم بریزد.
-    return _LRE + "".join(parts) + _PDF
+    # در متون راست‌به‌چپ تلگرام (مثل زبان فارسی ربات)، تصاویر و ایموجی‌ها از راست چیده می‌شوند.
+    # با معکوس کردن لیست، ترتیب بصری ارقام به طور خودکار از چپ به راست تنظیم و ایزوله می‌شود.
+    parts.reverse()
+
+    return "".join(parts)
 
 
 def hashtag(tag_text: str, premium: bool = True) -> str:
@@ -104,14 +103,14 @@ _ENTITY_OPEN_RE = re.compile(
 
 
 def entity_count(html_text: str) -> int:
-    """تعداد entity های پیام (سقف تلگرام ۱۰۰ تا است): هر تگ باز شده‌ی HTML یک entity حساب می‌شود."""
+    """تعداد entity های پیام (سقف تلگرام ۱۰۰ تا است)."""
     if not html_text:
         return 0
     return len(_ENTITY_OPEN_RE.findall(html_text))
 
 
 def test_text() -> str:
-    """متن آزمایشی برای دستور /emojitest: همه‌ی ایموجی‌ها و ارقام را نشان می‌دهد."""
+    """متن آزمایشی برای دستور /emojitest."""
     lines = ["<b>تست ایموجی‌های پریمیوم</b>", ""]
     for name in IDS:
         lines.append(f"{name}: {e(name)}")
